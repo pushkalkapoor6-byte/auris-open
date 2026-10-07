@@ -1,0 +1,2037 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<script>
+/* ===== DEMO MODE: runs the real backend (Code.gs) inside the browser with in-memory data ===== */
+(function () {
+  function conv(v) {
+    if (typeof v === 'string') { if (v.charAt(0) === "'") return v.slice(1); if (/^-?\d+(\.\d+)?$/.test(v)) return Number(v); }
+    return v === undefined || v === null ? '' : v;
+  }
+  function Range(sh, r, c, nr, nc) { this.sh = sh; this.r = r; this.c = c; this.nr = nr || 1; this.nc = nc || 1; }
+  Range.prototype.getValues = function () { var out = []; for (var i = 0; i < this.nr; i++) { var row = this.sh.data[this.r - 1 + i] || [], o = []; for (var j = 0; j < this.nc; j++) o.push(row[this.c - 1 + j] === undefined ? '' : row[this.c - 1 + j]); out.push(o); } return out; };
+  Range.prototype.setValues = function (v) { for (var i = 0; i < this.nr; i++) { var ri = this.r - 1 + i; while (this.sh.data.length <= ri) this.sh.data.push([]); for (var j = 0; j < this.nc; j++) this.sh.data[ri][this.c - 1 + j] = conv(v[i][j]); } return this; };
+  Range.prototype.setValue = function (x) { return this.setValues([[x]]); };
+  Range.prototype.clearContent = function () { for (var i = 0; i < this.nr; i++) { var row = this.sh.data[this.r - 1 + i]; if (row) for (var j = 0; j < this.nc; j++) row[this.c - 1 + j] = ''; } return this; };
+  Range.prototype.setFontWeight = function () { return this; };
+  function Sheet(name) { this.name = name; this.data = []; }
+  Sheet.prototype.getLastRow = function () { for (var i = this.data.length - 1; i >= 0; i--) if ((this.data[i] || []).some(function (v) { return v !== '' && v !== undefined; })) return i + 1; return 0; };
+  Sheet.prototype.getRange = function (r, c, nr, nc) { return new Range(this, r, c, nr, nc); };
+  Sheet.prototype.appendRow = function (arr) { var at = this.getLastRow(); this.data.length = at; this.data.push(arr.map(conv)); };
+  Sheet.prototype.deleteRow = function (r) { this.data.splice(r - 1, 1); };
+  Sheet.prototype.setFrozenRows = function () {};
+  var sheets = {};
+  var ss = {
+    getSheetByName: function (n) { return sheets[n] || null; }, insertSheet: function (n) { return (sheets[n] = new Sheet(n)); },
+    getSheets: function () { return Object.keys(sheets).map(function (k) { return sheets[k]; }); }, deleteSheet: function (s) { delete sheets[s.name]; },
+    getUrl: function () { return '#demo-sheet'; }, getId: function () { return 'DEMO'; }
+  };
+  var cache = {}, files = {};
+  var uuid = function () { return (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function (c) { var r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); }); };
+  var folder = { createFile: function (b) { var id = 'F' + uuid().slice(0, 8); files[id] = b; return { getId: function () { return id; } }; } };
+  var G = {
+    SpreadsheetApp: { getActiveSpreadsheet: function () { return ss; }, openById: function () { return ss; } },
+    LockService: { getScriptLock: function () { return { waitLock: function () {}, releaseLock: function () {} }; } },
+    CacheService: { getScriptCache: function () { return { get: function (k) { return cache[k] || null; }, put: function (k, v) { cache[k] = v; } }; } },
+    Session: { getScriptTimeZone: function () { return 'Asia/Kolkata'; } },
+    Utilities: {
+      getUuid: uuid,
+      base64Decode: function (s) { var b = atob(s), a = new Array(b.length); for (var i = 0; i < b.length; i++) a[i] = b.charCodeAt(i); return a; },
+      base64Encode: function (a) { var s = ''; for (var i = 0; i < a.length; i += 8192) s += String.fromCharCode.apply(null, a.slice(i, i + 8192)); return btoa(s); },
+      newBlob: function (bytes, mime) { return { getBytes: function () { return bytes; }, getContentType: function () { return mime; } }; },
+      formatDate: function (d, tz, f) {
+        var p = new Intl.DateTimeFormat('en-GB', { timeZone: 'Asia/Kolkata', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false }).formatToParts(d);
+        var g = function (t) { return p.filter(function (x) { return x.type === t; })[0].value; };
+        return f.replace('yyyy', g('year')).replace('MM', g('month')).replace('dd', g('day')).replace('HH', g('hour')).replace('mm', g('minute'));
+      }
+    },
+    DriveApp: {
+      getFoldersByName: function () { var done = false; return { hasNext: function () { return !done; }, next: function () { done = true; return folder; } }; },
+      createFolder: function () { return folder; }, getFileById: function (id) { return { getBlob: function () { return files[id]; } }; }
+    }
+  };
+  var backend = (function (SpreadsheetApp, LockService, CacheService, Session, Utilities, DriveApp, HtmlService) {
+/**
+ * AURIS OPEN – Tournament Portal (Google Apps Script backend)
+ * Database: the Google Sheet this script is attached to.
+ * Free: runs on your Google account only.
+ *
+ * First time:  Run  setup()  once from the Apps Script editor (grants permissions, builds tabs).
+ * Then:        Deploy > New deployment > Web app > Execute as: Me, Who has access: Anyone.
+ */
+
+// Leave blank when the script is attached to the sheet (Extensions > Apps Script).
+var SHEET_ID = '';
+var SCREENSHOT_FOLDER = 'Auris Open - Payment Screenshots';
+var SESSION_HOURS = 6;
+
+var TABS = {
+  Settings:   ['Key', 'Value', 'Notes'],
+  Users:      ['Name', 'Role', 'PIN', 'Active'],
+  Categories: ['CategoryID', 'Name', 'Type', 'Format', 'Groups', 'Fee', 'MaxEntries', 'SlotMinutes', 'Status', 'Order', 'Notes'],
+  Entries:    ['EntryID', 'RegID', 'Timestamp', 'CategoryID', 'Player1', 'P1Tower', 'P1Flat', 'P1Phone',
+               'Player2', 'P2Tower', 'P2Flat', 'P2Phone', 'LastTournament', 'LastCategory', 'LastResult',
+               'Fee', 'PaymentMode', 'PaymentRef', 'ScreenshotID', 'PaymentStatus', 'ApprovedBy', 'ApprovedAt',
+               'Seed', 'Group', 'Status', 'Remarks'],
+  Matches:    ['MatchID', 'CategoryID', 'Stage', 'Round', 'RoundNo', 'Group', 'MatchNo', 'SideA', 'SideB',
+               'NextMatch', 'NextSlot', 'Date', 'Time', 'Court', 'Score', 'Winner', 'Result',
+               'EnteredBy', 'EnteredAt', 'Notes'],
+  Accounts:   ['TxnID', 'Date', 'Type', 'Head', 'Description', 'Amount', 'Mode', 'Party', 'Reference', 'EnteredBy', 'EnteredAt'],
+  Log:        ['Timestamp', 'User', 'Action', 'Details']
+};
+
+var DEFAULT_SETTINGS = [
+  ['TournamentName', 'Auris Open 2026', 'Shown on every page'],
+  ['Tagline', 'Auris Serenity Towers 1, 2 & 3', ''],
+  ['Venue', 'Auris Serenity society tennis court', ''],
+  ['Dates', 'To be confirmed', 'Free text shown to players'],
+  ['About', 'Our annual society tennis tournament. Register below, pay the entry fee and check your draw and match times here.', ''],
+  ['RegistrationOpen', 'Yes', 'Yes / No'],
+  ['MaxCategoriesPerPlayer', '2', 'Per person (by phone number)'],
+  ['UPIId', '', 'e.g. organiser@okhdfcbank – used for the QR code'],
+  ['UPIName', 'Auris Open Organising Committee', 'Payee name shown in UPI apps'],
+  ['PaymentNote', 'Pay by UPI and upload the screenshot, or choose Cash and hand it to the organiser. Your entry is confirmed once the organiser approves it.', ''],
+  ['ContactName', '', 'Organiser to contact'],
+  ['ContactPhone', '', ''],
+  ['PlayDays', '2026-11-07 07:00-19:00\n2026-11-08 07:00-19:00', 'One line per day: YYYY-MM-DD HH:MM-HH:MM (add weekday evenings as extra lines)'],
+  ['Courts', '1', 'Number of courts'],
+  ['DefaultSlotMinutes', '40', 'Minutes per match incl. changeover (category can override)'],
+  ['RestMinutes', '30', 'Minimum gap between two matches of the same player'],
+  ['IncomeHeads', 'Donation, Society contribution, Sponsorship, Other income', 'Entry fees are counted automatically'],
+  ['ExpenseHeads', 'Balls, Trophies & medals, Refreshments, Referees, Court & equipment, Printing & banners, First aid, Miscellaneous', ''],
+  ['Rules', 'Report 15 minutes before your match time.\nA player not on court 10 minutes after the call loses by walkover.\nMatch format for each round is announced by the organisers.\nThe referee\'s decision is final.', 'Shown on the Home page']
+];
+
+var DEFAULT_CATEGORIES = [
+  ['MS', "Men's Singles", 'Singles', 'Knockout', 1, 500, 32, '', 'Open', 1, ''],
+  ['WS', "Women's Singles", 'Singles', 'Round Robin', 1, 500, 16, '', 'Open', 2, ''],
+  ['MD', "Men's Doubles", 'Doubles', 'Knockout', 1, 800, 16, '', 'Open', 3, 'Fee per pair'],
+  ['WD', "Women's Doubles", 'Doubles', 'Round Robin', 1, 800, 8, '', 'Open', 4, 'Fee per pair'],
+  ['XD', 'Mixed Doubles', 'Doubles', 'Knockout', 1, 800, 16, '', 'Open', 5, 'Fee per pair'],
+  ['JR', 'Juniors (U-14)', 'Singles', 'Round Robin', 1, 300, 16, 30, 'Open', 6, '']
+];
+
+/* ======================= WEB APP ======================= */
+
+function doGet() {
+  return HtmlService.createHtmlOutputFromFile('Index')
+    .setTitle('Auris Open')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, maximum-scale=1');
+}
+
+/** Single entry point used by the page: google.script.run.api(action, payloadJson, token) */
+function api(action, payloadJson, token) {
+  try {
+    var p = payloadJson ? JSON.parse(payloadJson) : {};
+    var fn = ACTIONS[action];
+    if (!fn) throw new Error('Unknown action: ' + action);
+    var user = null;
+    if (fn.role) {
+      user = checkToken_(token);
+      if (!user) throw new Error('Session expired. Please log in again.');
+      if (fn.role === 'Admin' && user.role !== 'Admin') throw new Error('Only an Admin can do this.');
+      if (fn.role === 'Organiser' && user.role === 'Scorer') throw new Error('Scorers can only enter scores.');
+    }
+    var out;
+    if (fn.write) {
+      var lock = LockService.getScriptLock();
+      lock.waitLock(20000);
+      try { out = fn.run(p, user); } finally { lock.releaseLock(); }
+    } else {
+      out = fn.run(p, user);
+    }
+    return JSON.stringify({ ok: true, data: out === undefined ? null : out });
+  } catch (e) {
+    return JSON.stringify({ ok: false, error: String(e && e.message || e) });
+  }
+}
+
+var ACTIONS = {
+  // ---- public ----
+  getPublic:   { run: function () { return publicData_(); } },
+  register:    { write: true, run: function (p) { return register_(p); } },
+  lookup:      { run: function (p) { return lookup_(p.phone); } },
+  login:       { run: function (p) { return login_(p.name, p.pin); } },
+  // ---- scorer + above ----
+  getScorer:   { role: 'Scorer', run: function () { return scorerData_(); } },
+  saveScore:   { role: 'Scorer', write: true, run: function (p, u) { return saveScore_(p, u); } },
+  // ---- organiser + admin ----
+  getAdmin:    { role: 'Organiser', run: function (p, u) { return adminData_(u); } },
+  setPayment:  { role: 'Organiser', write: true, run: function (p, u) { return setPayment_(p, u); } },
+  updateEntry: { role: 'Organiser', write: true, run: function (p, u) { return updateEntry_(p, u); } },
+  addEntry:    { role: 'Organiser', write: true, run: function (p, u) { return addEntryAdmin_(p, u); } },
+  deleteEntry: { role: 'Organiser', write: true, run: function (p, u) { return deleteEntry_(p, u); } },
+  getScreenshot: { role: 'Organiser', run: function (p) { return getScreenshot_(p.id); } },
+  saveCategory:  { role: 'Organiser', write: true, run: function (p, u) { return saveCategory_(p, u); } },
+  deleteCategory:{ role: 'Organiser', write: true, run: function (p, u) { return deleteCategory_(p, u); } },
+  generateDraw:  { role: 'Organiser', write: true, run: function (p, u) { return generateDraw_(p, u); } },
+  clearDraw:     { role: 'Organiser', write: true, run: function (p, u) { return clearDraw_(p, u); } },
+  editMatch:     { role: 'Organiser', write: true, run: function (p, u) { return editMatch_(p, u); } },
+  addMatch:      { role: 'Organiser', write: true, run: function (p, u) { return addMatch_(p, u); } },
+  deleteMatch:   { role: 'Organiser', write: true, run: function (p, u) { return deleteMatch_(p, u); } },
+  clearScore:    { role: 'Organiser', write: true, run: function (p, u) { return clearScore_(p, u); } },
+  autoSchedule:  { role: 'Organiser', write: true, run: function (p, u) { return autoSchedule_(p, u); } },
+  saveTxn:       { role: 'Organiser', write: true, run: function (p, u) { return saveTxn_(p, u); } },
+  deleteTxn:     { role: 'Organiser', write: true, run: function (p, u) { return deleteTxn_(p, u); } },
+  // ---- admin only ----
+  saveSettings:  { role: 'Admin', write: true, run: function (p, u) { return saveSettings_(p, u); } },
+  saveUser:      { role: 'Admin', write: true, run: function (p, u) { return saveUser_(p, u); } },
+  deleteUser:    { role: 'Admin', write: true, run: function (p, u) { return deleteUser_(p, u); } }
+};
+
+/* ======================= SETUP ======================= */
+
+function setup() {
+  var ss = ss_();
+  Object.keys(TABS).forEach(function (name) {
+    var sh = ss.getSheetByName(name);
+    if (!sh) sh = ss.insertSheet(name);
+    var headers = TABS[name];
+    if (sh.getLastRow() === 0) {
+      sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+      sh.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+      sh.setFrozenRows(1);
+    }
+  });
+  if (readTable_('Settings').length === 0) {
+    DEFAULT_SETTINGS.forEach(function (r) { appendObj_('Settings', { Key: r[0], Value: r[1], Notes: r[2] }); });
+  } else {
+    var have = {};
+    readTable_('Settings').forEach(function (r) { have[r.Key] = true; });
+    DEFAULT_SETTINGS.forEach(function (r) { if (!have[r[0]]) appendObj_('Settings', { Key: r[0], Value: r[1], Notes: r[2] }); });
+  }
+  if (readTable_('Users').length === 0) {
+    appendObj_('Users', { Name: 'Admin', Role: 'Admin', PIN: '1234', Active: 'Yes' });
+  }
+  if (readTable_('Categories').length === 0) {
+    DEFAULT_CATEGORIES.forEach(function (c) {
+      var o = {}; TABS.Categories.forEach(function (h, i) { o[h] = c[i]; });
+      appendObj_('Categories', o);
+    });
+  }
+  var s1 = ss.getSheetByName('Sheet1');
+  if (s1 && ss.getSheets().length > 1 && s1.getLastRow() === 0) ss.deleteSheet(s1);
+  screenshotFolder_();
+  return 'Setup complete';
+}
+
+/* ======================= SHEET HELPERS ======================= */
+
+function ss_() { return SHEET_ID ? SpreadsheetApp.openById(SHEET_ID) : SpreadsheetApp.getActiveSpreadsheet(); }
+
+function sheet_(name) {
+  var sh = ss_().getSheetByName(name);
+  if (!sh) throw new Error('Tab "' + name + '" is missing. Run setup() once from the script editor.');
+  return sh;
+}
+
+function readTable_(name) {
+  var sh = sheet_(name);
+  var last = sh.getLastRow();
+  var headers = TABS[name];
+  if (last < 2) return [];
+  var vals = sh.getRange(2, 1, last - 1, headers.length).getValues();
+  var out = [];
+  for (var i = 0; i < vals.length; i++) {
+    var row = vals[i];
+    var empty = true;
+    var o = { _row: i + 2 };
+    for (var j = 0; j < headers.length; j++) {
+      var v = row[j];
+      if (v instanceof Date) v = fmtDate_(v, headers[j] === 'Time' ? 'HH:mm' : (headers[j] === 'Date' ? 'yyyy-MM-dd' : 'yyyy-MM-dd HH:mm'));
+      if (v !== '' && v !== null) empty = false;
+      o[headers[j]] = v;
+    }
+    if (!empty) out.push(o);
+  }
+  return out;
+}
+
+function cell_(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'number' || typeof v === 'boolean') return v;
+  v = String(v);
+  return v === '' ? '' : "'" + v; // force text so "4-1" never becomes a date
+}
+
+function rowArr_(name, obj) { return TABS[name].map(function (h) { return cell_(obj[h]); }); }
+
+function appendObj_(name, obj) { sheet_(name).appendRow(rowArr_(name, obj)); }
+
+function appendMany_(name, objs) {
+  if (!objs.length) return;
+  var sh = sheet_(name);
+  var start = Math.max(sh.getLastRow(), 1) + 1;
+  sh.getRange(start, 1, objs.length, TABS[name].length).setValues(objs.map(function (o) { return rowArr_(name, o); }));
+}
+
+function updateObj_(name, obj) {
+  if (!obj._row) throw new Error('Row not found');
+  sheet_(name).getRange(obj._row, 1, 1, TABS[name].length).setValues([rowArr_(name, obj)]);
+}
+
+function writeAll_(name, objs) {
+  // rewrite whole table body (used for bulk updates)
+  var sh = sheet_(name);
+  var last = sh.getLastRow();
+  var n = TABS[name].length;
+  if (last > 1) sh.getRange(2, 1, last - 1, n).clearContent();
+  if (objs.length) sh.getRange(2, 1, objs.length, n).setValues(objs.map(function (o) { return rowArr_(name, o); }));
+}
+
+function deleteRows_(name, rows) {
+  var sh = sheet_(name);
+  rows.sort(function (a, b) { return b - a; }).forEach(function (r) { sh.deleteRow(r); });
+}
+
+function settings_() {
+  var s = {};
+  readTable_('Settings').forEach(function (r) { s[r.Key] = String(r.Value); });
+  return s;
+}
+
+function log_(user, action, details) {
+  try { appendObj_('Log', { Timestamp: now_(), User: user ? user.name : 'Public', Action: action, Details: details || '' }); } catch (e) {}
+}
+
+function tz_() { return Session.getScriptTimeZone() || 'Asia/Kolkata'; }
+function fmtDate_(d, f) { return Utilities.formatDate(d, tz_(), f); }
+function now_() { return fmtDate_(new Date(), 'yyyy-MM-dd HH:mm'); }
+function id_(prefix) { return prefix + Utilities.getUuid().replace(/-/g, '').slice(0, 8).toUpperCase(); }
+function phone_(p) { var d = String(p || '').replace(/\D/g, ''); return d.length > 10 ? d.slice(-10) : d; }
+function str_(v) { return String(v === null || v === undefined ? '' : v).trim(); }
+function num_(v) { var n = Number(v); return isNaN(n) ? 0 : n; }
+function yes_(v) { return /^(y|yes|true|1)$/i.test(str_(v)); }
+
+/* ======================= AUTH ======================= */
+
+function login_(name, pin) {
+  var users = readTable_('Users').filter(function (u) {
+    return str_(u.Name).toLowerCase() === str_(name).toLowerCase() && str_(u.PIN) === str_(pin) && yes_(u.Active);
+  });
+  if (!users.length) throw new Error('Wrong name or PIN.');
+  var u = users[0];
+  var role = ['Admin', 'Organiser', 'Scorer'].indexOf(str_(u.Role)) >= 0 ? str_(u.Role) : 'Scorer';
+  var token = Utilities.getUuid();
+  CacheService.getScriptCache().put('tok_' + token, JSON.stringify({ name: str_(u.Name), role: role }), SESSION_HOURS * 3600);
+  log_({ name: str_(u.Name) }, 'login', role);
+  return { token: token, name: str_(u.Name), role: role };
+}
+
+function checkToken_(token) {
+  if (!token) return null;
+  var v = CacheService.getScriptCache().get('tok_' + token);
+  return v ? JSON.parse(v) : null;
+}
+
+/* ======================= READ MODELS ======================= */
+
+function entryName_(e) {
+  if (!e) return '';
+  return str_(e.Player2) ? str_(e.Player1) + ' / ' + str_(e.Player2) : str_(e.Player1);
+}
+
+function entryTower_(e) {
+  if (!e) return '';
+  var t = [str_(e.P1Tower)];
+  if (str_(e.Player2) && str_(e.P2Tower) && str_(e.P2Tower) !== str_(e.P1Tower)) t.push(str_(e.P2Tower));
+  return t.filter(String).join(' / ');
+}
+
+function publicEntry_(e) {
+  return { id: e.EntryID, cat: e.CategoryID, name: entryName_(e), tower: entryTower_(e), seed: e.Seed, group: e.Group };
+}
+
+function cleanMatch_(m) {
+  var o = {}; TABS.Matches.forEach(function (h) { o[h] = m[h]; }); return o;
+}
+
+function publicSettings_(s) {
+  return {
+    TournamentName: s.TournamentName, Tagline: s.Tagline, Venue: s.Venue, Dates: s.Dates, About: s.About,
+    RegistrationOpen: yes_(s.RegistrationOpen), MaxCategoriesPerPlayer: num_(s.MaxCategoriesPerPlayer) || 99,
+    UPIId: s.UPIId, UPIName: s.UPIName, PaymentNote: s.PaymentNote, ContactName: s.ContactName,
+    ContactPhone: s.ContactPhone, Rules: s.Rules
+  };
+}
+
+function publicData_() {
+  var s = settings_();
+  var cats = readTable_('Categories').map(cleanCat_);
+  var entries = readTable_('Entries');
+  var counts = {};
+  entries.forEach(function (e) { if (str_(e.Status) !== 'Withdrawn') counts[e.CategoryID] = (counts[e.CategoryID] || 0) + 1; });
+  cats.forEach(function (c) { c.Entries = counts[c.CategoryID] || 0; });
+  var approved = entries.filter(function (e) { return e.PaymentStatus === 'Approved' && str_(e.Status) !== 'Withdrawn'; });
+  return {
+    settings: publicSettings_(s),
+    categories: cats,
+    entries: approved.map(publicEntry_),
+    matches: readTable_('Matches').map(cleanMatch_)
+  };
+}
+
+function cleanCat_(c) { var o = {}; TABS.Categories.forEach(function (h) { o[h] = c[h]; }); return o; }
+
+function cleanEntry_(e) { var o = {}; TABS.Entries.forEach(function (h) { o[h] = e[h]; }); return o; }
+
+function lookup_(phone) {
+  var ph = phone_(phone);
+  if (ph.length < 10) throw new Error('Enter your 10-digit mobile number.');
+  var mine = readTable_('Entries').filter(function (e) { return phone_(e.P1Phone) === ph || phone_(e.P2Phone) === ph; });
+  return {
+    entries: mine.map(function (e) {
+      return { id: e.EntryID, reg: e.RegID, cat: e.CategoryID, name: entryName_(e), fee: e.Fee, mode: e.PaymentMode,
+               payment: e.PaymentStatus, status: e.Status || 'Active', time: e.Timestamp };
+    })
+  };
+}
+
+function scorerData_() {
+  var entries = readTable_('Entries');
+  return {
+    settings: publicSettings_(settings_()),
+    categories: readTable_('Categories').map(cleanCat_),
+    entries: entries.map(publicEntry_),
+    matches: readTable_('Matches').map(cleanMatch_)
+  };
+}
+
+function adminData_(u) {
+  var s = settings_();
+  return {
+    me: u,
+    settingsRaw: readTable_('Settings').map(function (r) { return { Key: r.Key, Value: String(r.Value), Notes: r.Notes }; }),
+    settings: publicSettings_(s),
+    play: { PlayDays: s.PlayDays, Courts: num_(s.Courts) || 1, DefaultSlotMinutes: num_(s.DefaultSlotMinutes) || 40, RestMinutes: num_(s.RestMinutes) },
+    heads: { income: splitList_(s.IncomeHeads), expense: splitList_(s.ExpenseHeads) },
+    categories: readTable_('Categories').map(cleanCat_),
+    entries: readTable_('Entries').map(cleanEntry_),
+    matches: readTable_('Matches').map(cleanMatch_),
+    accounts: readTable_('Accounts').map(function (t) { var o = {}; TABS.Accounts.forEach(function (h) { o[h] = t[h]; }); return o; }),
+    users: u.role === 'Admin' ? readTable_('Users').map(function (x) { return { Name: x.Name, Role: x.Role, PIN: x.PIN, Active: x.Active }; }) : [],
+    sheetUrl: ss_().getUrl(),
+    sheetId: ss_().getId()
+  };
+}
+
+function splitList_(s) { return str_(s).split(',').map(function (x) { return x.trim(); }).filter(String); }
+
+/* ======================= REGISTRATION ======================= */
+
+function register_(p) {
+  var s = settings_();
+  if (!yes_(s.RegistrationOpen)) throw new Error('Registrations are closed.');
+  return createEntries_(p, null);
+}
+
+function createEntries_(p, user) {
+  var s = settings_();
+  var p1 = p.player || {};
+  if (!str_(p1.name)) throw new Error('Please enter your name.');
+  var ph1 = phone_(p1.phone);
+  if (ph1.length !== 10) throw new Error('Please enter a valid 10-digit mobile number.');
+  if (!str_(p1.tower)) throw new Error('Please select your tower.');
+  var picks = p.categories || [];
+  if (!picks.length) throw new Error('Please choose at least one category.');
+
+  var cats = {};
+  readTable_('Categories').forEach(function (c) { cats[c.CategoryID] = c; });
+  var entries = readTable_('Entries').filter(function (e) { return str_(e.Status) !== 'Withdrawn'; });
+  var maxCats = num_(s.MaxCategoriesPerPlayer) || 99;
+
+  var existingForPhone = function (ph) {
+    return entries.filter(function (e) { return phone_(e.P1Phone) === ph || phone_(e.P2Phone) === ph; });
+  };
+  if (!user && existingForPhone(ph1).length + picks.length > maxCats) {
+    throw new Error('Each player can enter at most ' + maxCats + ' categories. You already have ' + existingForPhone(ph1).length + '.');
+  }
+
+  var regId = id_('R');
+  var ts = now_();
+  var rows = [];
+  var total = 0;
+  var seen = {};
+  picks.forEach(function (pk) {
+    var c = cats[pk.catId];
+    if (!c) throw new Error('Unknown category.');
+    if (seen[pk.catId]) throw new Error('Category chosen twice: ' + c.Name);
+    seen[pk.catId] = true;
+    if (!user && str_(c.Status) !== 'Open') throw new Error(c.Name + ' is closed for entries.');
+    var inCat = entries.filter(function (e) { return e.CategoryID === c.CategoryID; });
+    var max = num_(c.MaxEntries);
+    if (max && inCat.length >= max && !user) throw new Error(c.Name + ' is full (' + max + ' entries).');
+    var dup = inCat.filter(function (e) { return phone_(e.P1Phone) === ph1 || phone_(e.P2Phone) === ph1; });
+    if (dup.length) throw new Error('You are already entered in ' + c.Name + ' (' + entryName_(dup[0]) + ').');
+    var partner = pk.partner || {};
+    var ph2 = '';
+    if (str_(c.Type) === 'Doubles') {
+      if (!str_(partner.name)) throw new Error('Please enter your partner\'s name for ' + c.Name + '.');
+      ph2 = phone_(partner.phone);
+      if (ph2 && ph2.length !== 10) throw new Error('Partner\'s mobile number for ' + c.Name + ' looks wrong.');
+      if (ph2 && ph2 === ph1) throw new Error('Partner\'s number cannot be the same as yours.');
+      if (ph2) {
+        var dup2 = inCat.filter(function (e) { return phone_(e.P1Phone) === ph2 || phone_(e.P2Phone) === ph2; });
+        if (dup2.length) throw new Error(str_(partner.name) + ' is already entered in ' + c.Name + ' (' + entryName_(dup2[0]) + ').');
+      }
+    }
+    var fee = num_(c.Fee);
+    total += fee;
+    rows.push({
+      EntryID: id_('E'), RegID: regId, Timestamp: ts, CategoryID: c.CategoryID,
+      Player1: str_(p1.name), P1Tower: str_(p1.tower), P1Flat: str_(p1.flat), P1Phone: ph1,
+      Player2: str_(c.Type) === 'Doubles' ? str_(partner.name) : '',
+      P2Tower: str_(c.Type) === 'Doubles' ? str_(partner.tower) : '',
+      P2Flat: str_(c.Type) === 'Doubles' ? str_(partner.flat) : '',
+      P2Phone: ph2,
+      LastTournament: str_(p.last && p.last.tournament), LastCategory: str_(p.last && p.last.category),
+      LastResult: str_(p.last && p.last.result),
+      Fee: fee, PaymentMode: p.paymentMode === 'Cash' ? 'Cash' : 'UPI', PaymentRef: str_(p.paymentRef),
+      ScreenshotID: '', PaymentStatus: 'Pending', ApprovedBy: '', ApprovedAt: '', Seed: '', Group: '',
+      Status: 'Active', Remarks: str_(p.remarks)
+    });
+  });
+
+  if (p.paymentMode !== 'Cash' && !user) {
+    if (!p.screenshot || !p.screenshot.data) throw new Error('Please upload the payment screenshot (or choose Cash).');
+  }
+  var shotId = '';
+  if (p.screenshot && p.screenshot.data) {
+    var bytes = Utilities.base64Decode(String(p.screenshot.data).replace(/^data:[^,]+,/, ''));
+    if (bytes.length > 4 * 1024 * 1024) throw new Error('Screenshot is too large (max 4 MB).');
+    var blob = Utilities.newBlob(bytes, p.screenshot.mime || 'image/jpeg', regId + '_' + str_(p1.name).replace(/\W+/g, '_') + '.jpg');
+    shotId = screenshotFolder_().createFile(blob).getId();
+  }
+  rows.forEach(function (r) {
+    r.ScreenshotID = shotId;
+    if (user && p.approveNow) { r.PaymentStatus = 'Approved'; r.ApprovedBy = user.name; r.ApprovedAt = ts; }
+  });
+  appendMany_('Entries', rows);
+  log_(user, 'register', regId + ' ' + str_(p1.name) + ' ' + rows.map(function (r) { return r.CategoryID; }).join(','));
+  return { regId: regId, total: total, count: rows.length };
+}
+
+function screenshotFolder_() {
+  var it = DriveApp.getFoldersByName(SCREENSHOT_FOLDER);
+  return it.hasNext() ? it.next() : DriveApp.createFolder(SCREENSHOT_FOLDER);
+}
+
+function getScreenshot_(id) {
+  if (!id) throw new Error('No screenshot');
+  var b = DriveApp.getFileById(id).getBlob();
+  return 'data:' + b.getContentType() + ';base64,' + Utilities.base64Encode(b.getBytes());
+}
+
+/* ======================= ENTRIES (ADMIN) ======================= */
+
+function setPayment_(p, u) {
+  var status = ['Approved', 'Pending', 'Rejected'].indexOf(p.status) >= 0 ? p.status : 'Approved';
+  var rows = readTable_('Entries').filter(function (e) { return p.regId ? e.RegID === p.regId : e.EntryID === p.entryId; });
+  if (!rows.length) throw new Error('Entry not found');
+  rows.forEach(function (e) {
+    e.PaymentStatus = status;
+    if (p.mode) e.PaymentMode = p.mode;
+    e.ApprovedBy = status === 'Pending' ? '' : u.name;
+    e.ApprovedAt = status === 'Pending' ? '' : now_();
+    updateObj_('Entries', e);
+  });
+  log_(u, 'payment ' + status, (p.regId || p.entryId) + ' x' + rows.length);
+  return rows.length;
+}
+
+function updateEntry_(p, u) {
+  var e = readTable_('Entries').filter(function (x) { return x.EntryID === p.EntryID; })[0];
+  if (!e) throw new Error('Entry not found');
+  ['Player1', 'P1Tower', 'P1Flat', 'P1Phone', 'Player2', 'P2Tower', 'P2Flat', 'P2Phone', 'LastTournament',
+   'LastCategory', 'LastResult', 'Fee', 'PaymentMode', 'PaymentRef', 'Seed', 'Group', 'Status', 'Remarks', 'CategoryID'
+  ].forEach(function (k) { if (p[k] !== undefined) e[k] = p[k]; });
+  e.P1Phone = phone_(e.P1Phone); e.P2Phone = phone_(e.P2Phone);
+  e.Fee = num_(e.Fee);
+  e.Seed = str_(e.Seed) === '' ? '' : num_(e.Seed);
+  updateObj_('Entries', e);
+  log_(u, 'edit entry', e.EntryID);
+  return true;
+}
+
+function addEntryAdmin_(p, u) { return createEntries_(p, u); }
+
+function deleteEntry_(p, u) {
+  var used = readTable_('Matches').some(function (m) { return m.SideA === p.EntryID || m.SideB === p.EntryID; });
+  if (used) throw new Error('This entry is already in a draw. Mark it Withdrawn instead, or clear the draw first.');
+  var e = readTable_('Entries').filter(function (x) { return x.EntryID === p.EntryID; })[0];
+  if (!e) throw new Error('Entry not found');
+  deleteRows_('Entries', [e._row]);
+  log_(u, 'delete entry', p.EntryID + ' ' + entryName_(e));
+  return true;
+}
+
+/* ======================= CATEGORIES ======================= */
+
+function saveCategory_(p, u) {
+  var cats = readTable_('Categories');
+  var id = str_(p.CategoryID).toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (!id) throw new Error('Category code is required (e.g. MS).');
+  if (!str_(p.Name)) throw new Error('Category name is required.');
+  var c = cats.filter(function (x) { return x.CategoryID === id; })[0];
+  var o = c || {};
+  o.CategoryID = id; o.Name = str_(p.Name);
+  o.Type = p.Type === 'Doubles' ? 'Doubles' : 'Singles';
+  o.Format = p.Format === 'Round Robin' ? 'Round Robin' : 'Knockout';
+  o.Groups = Math.max(1, num_(p.Groups) || 1);
+  o.Fee = num_(p.Fee); o.MaxEntries = num_(p.MaxEntries) || '';
+  o.SlotMinutes = num_(p.SlotMinutes) || '';
+  o.Status = p.Status === 'Closed' ? 'Closed' : 'Open';
+  o.Order = num_(p.Order) || cats.length + 1; o.Notes = str_(p.Notes);
+  if (c) updateObj_('Categories', o); else appendObj_('Categories', o);
+  log_(u, c ? 'edit category' : 'add category', id);
+  return true;
+}
+
+function deleteCategory_(p, u) {
+  var hasEntries = readTable_('Entries').some(function (e) { return e.CategoryID === p.CategoryID; });
+  if (hasEntries) throw new Error('This category has entries. Close it instead of deleting.');
+  var c = readTable_('Categories').filter(function (x) { return x.CategoryID === p.CategoryID; })[0];
+  if (!c) throw new Error('Category not found');
+  deleteRows_('Categories', [c._row]);
+  log_(u, 'delete category', p.CategoryID);
+  return true;
+}
+
+/* ======================= DRAWS ======================= */
+
+function bracketOrder_(size) {
+  var order = [1, 2];
+  while (order.length < size) {
+    var n = order.length * 2, next = [];
+    order.forEach(function (s) { next.push(s); next.push(n + 1 - s); });
+    order = next;
+  }
+  return order;
+}
+
+function koRoundName_(matchesInRound) {
+  if (matchesInRound === 1) return 'Final';
+  if (matchesInRound === 2) return 'Semi-final';
+  if (matchesInRound === 4) return 'Quarter-final';
+  return 'Round of ' + (matchesInRound * 2);
+}
+
+function shuffle_(a) {
+  for (var i = a.length - 1; i > 0; i--) { var j = Math.floor(Math.random() * (i + 1)); var t = a[i]; a[i] = a[j]; a[j] = t; }
+  return a;
+}
+
+function orderedEntries_(list) {
+  var seeded = list.filter(function (e) { return str_(e.Seed) !== '' && num_(e.Seed) > 0; })
+                   .sort(function (a, b) { return num_(a.Seed) - num_(b.Seed); });
+  var unseeded = shuffle_(list.filter(function (e) { return !(str_(e.Seed) !== '' && num_(e.Seed) > 0); }));
+  return seeded.concat(unseeded);
+}
+
+function generateDraw_(p, u) {
+  var cat = readTable_('Categories').filter(function (c) { return c.CategoryID === p.CategoryID; })[0];
+  if (!cat) throw new Error('Category not found');
+  var existing = readTable_('Matches').filter(function (m) { return m.CategoryID === cat.CategoryID; });
+  if (existing.length) throw new Error('A draw already exists for ' + cat.Name + '. Clear it first.');
+  var list = readTable_('Entries').filter(function (e) {
+    return e.CategoryID === cat.CategoryID && e.PaymentStatus === 'Approved' && str_(e.Status) !== 'Withdrawn';
+  });
+  if (list.length < 2) throw new Error('Need at least 2 approved entries in ' + cat.Name + ' (found ' + list.length + ').');
+  var ordered = orderedEntries_(list);
+  var format = p.Format || cat.Format;
+  var offset = maxMatchNo_();   // match numbers are unique across the whole tournament
+  var matches = format === 'Round Robin' ? buildRR_(cat, ordered, num_(p.Groups) || num_(cat.Groups) || 1, offset)
+                                         : buildKO_(cat, ordered, offset);
+  appendMany_('Matches', matches);
+  log_(u, 'generate draw', cat.CategoryID + ' ' + format + ' ' + list.length + ' entries, ' + matches.length + ' matches');
+  return { matches: matches.length, entries: list.length };
+}
+
+function maxMatchNo_() {
+  return readTable_('Matches').reduce(function (mx, m) { return Math.max(mx, num_(m.MatchNo)); }, 0);
+}
+
+function buildKO_(cat, ordered, offset) {
+  var n = ordered.length;
+  var size = 1; while (size < n) size *= 2;
+  var order = bracketOrder_(size);
+  var slots = order.map(function (seedNo) { return seedNo <= n ? ordered[seedNo - 1].EntryID : 'BYE'; });
+  var rounds = Math.log(size) / Math.LN2;
+  var all = [], byRound = [], no = offset || 0;
+  for (var r = 1; r <= rounds; r++) {
+    var count = size / Math.pow(2, r), arr = [];
+    for (var k = 1; k <= count; k++) {
+      no++;
+      arr.push({
+        MatchID: cat.CategoryID + '-R' + r + '-' + k, CategoryID: cat.CategoryID, Stage: 'KO',
+        Round: koRoundName_(count), RoundNo: r, Group: '', MatchNo: no, SideA: '', SideB: '',
+        NextMatch: r < rounds ? cat.CategoryID + '-R' + (r + 1) + '-' + Math.ceil(k / 2) : '',
+        NextSlot: r < rounds ? (k % 2 === 1 ? 'A' : 'B') : '',
+        Date: '', Time: '', Court: '', Score: '', Winner: '', Result: 'Pending', EnteredBy: '', EnteredAt: '', Notes: ''
+      });
+    }
+    byRound.push(arr); all = all.concat(arr);
+  }
+  var index = {}; all.forEach(function (m) { index[m.MatchID] = m; });
+  byRound[0].forEach(function (m, i) { m.SideA = slots[2 * i]; m.SideB = slots[2 * i + 1]; });
+  byRound[0].forEach(function (m) {
+    if (m.SideA === 'BYE' || m.SideB === 'BYE') {
+      m.Winner = m.SideA === 'BYE' ? m.SideB : m.SideA;
+      m.Result = 'Bye'; m.Score = 'Bye';
+      advance_(index, m);
+    }
+  });
+  return all;
+}
+
+function advance_(index, m) {
+  if (!m.NextMatch) return;
+  var nx = index[m.NextMatch];
+  if (!nx) return;
+  if (m.NextSlot === 'A') nx.SideA = m.Winner || ''; else nx.SideB = m.Winner || '';
+}
+
+function buildRR_(cat, ordered, groups, offset) {
+  groups = Math.max(1, Math.min(groups, Math.floor(ordered.length / 2)));
+  var buckets = []; for (var g = 0; g < groups; g++) buckets.push([]);
+  ordered.forEach(function (e, i) {               // snake seeding
+    var row = Math.floor(i / groups), pos = i % groups;
+    buckets[row % 2 === 0 ? pos : groups - 1 - pos].push(e.EntryID);
+  });
+  var letters = 'ABCDEFGHIJ';
+  var all = [], no = offset || 0;
+  buckets.forEach(function (ids, gi) {
+    var gname = groups > 1 ? letters.charAt(gi) : '';
+    var list = ids.slice(); if (list.length % 2) list.push('BYE');
+    var n = list.length;
+    for (var r = 0; r < n - 1; r++) {
+      for (var i = 0; i < n / 2; i++) {
+        var a = list[i], b = list[n - 1 - i];
+        if (a === 'BYE' || b === 'BYE') continue;
+        no++;
+        all.push({
+          MatchID: cat.CategoryID + '-' + (gname || 'G') + '-' + (r + 1) + '-' + (i + 1), CategoryID: cat.CategoryID, Stage: 'RR',
+          Round: (gname ? 'Group ' + gname + ' · ' : '') + 'Round ' + (r + 1), RoundNo: r + 1, Group: gname, MatchNo: no,
+          SideA: a, SideB: b, NextMatch: '', NextSlot: '', Date: '', Time: '', Court: '', Score: '', Winner: '',
+          Result: 'Pending', EnteredBy: '', EnteredAt: '', Notes: ''
+        });
+      }
+      list.splice(1, 0, list.pop());               // circle method
+    }
+  });
+  // record group on entries
+  var eRows = readTable_('Entries');
+  buckets.forEach(function (ids, gi) {
+    ids.forEach(function (id) {
+      var e = eRows.filter(function (x) { return x.EntryID === id; })[0];
+      if (e) { e.Group = groups > 1 ? letters.charAt(gi) : ''; updateObj_('Entries', e); }
+    });
+  });
+  return all;
+}
+
+function clearDraw_(p, u) {
+  var ms = readTable_('Matches').filter(function (m) { return m.CategoryID === p.CategoryID; });
+  var played = ms.filter(function (m) { return m.Result !== 'Pending' && m.Result !== 'Bye'; });
+  if (played.length && !p.force) throw new Error(played.length + ' match(es) already have results. Tick "force" to clear anyway.');
+  deleteRows_('Matches', ms.map(function (m) { return m._row; }));
+  log_(u, 'clear draw', p.CategoryID + ' (' + ms.length + ' matches)');
+  return ms.length;
+}
+
+/* ======================= SCORES ======================= */
+
+function saveScore_(p, u) {
+  var all = readTable_('Matches');
+  var index = {}; all.forEach(function (m) { index[m.MatchID] = m; });
+  var m = index[p.MatchID];
+  if (!m) throw new Error('Match not found');
+  if (!m.SideA || !m.SideB || m.SideA === 'BYE' || m.SideB === 'BYE') throw new Error('Both players are not known yet for this match.');
+  var result = ['Completed', 'Walkover', 'Retired'].indexOf(p.Result) >= 0 ? p.Result : 'Completed';
+  var winner = p.Winner === 'A' ? m.SideA : p.Winner === 'B' ? m.SideB : '';
+  if (!winner) throw new Error('Please choose the winner.');
+  var score = str_(p.Score);
+  if (result === 'Walkover' && !score) score = 'W/O';
+  if (!score) throw new Error('Please enter the score (e.g. 4-1, 6-4 3-6 10-7).');
+  var oldWinner = m.Winner;
+  if (m.NextMatch && oldWinner && oldWinner !== winner) {
+    var nx = index[m.NextMatch];
+    if (nx && nx.Result !== 'Pending') throw new Error('The next-round match is already played. Clear that score first.');
+  }
+  m.Winner = winner; m.Score = score; m.Result = result;
+  m.EnteredBy = u.name; m.EnteredAt = now_();
+  if (p.Notes !== undefined) m.Notes = str_(p.Notes);
+  updateObj_('Matches', m);
+  if (m.NextMatch && index[m.NextMatch]) {
+    advance_(index, m);
+    updateObj_('Matches', index[m.NextMatch]);
+  }
+  log_(u, 'score', m.MatchID + ' ' + score + ' winner ' + winner);
+  return true;
+}
+
+function clearScore_(p, u) {
+  var all = readTable_('Matches');
+  var index = {}; all.forEach(function (m) { index[m.MatchID] = m; });
+  var m = index[p.MatchID];
+  if (!m) throw new Error('Match not found');
+  if (m.NextMatch && index[m.NextMatch]) {
+    var nx = index[m.NextMatch];
+    if (nx.Result !== 'Pending') throw new Error('The next-round match is already played. Clear that score first.');
+    if (m.NextSlot === 'A') nx.SideA = ''; else nx.SideB = '';
+    updateObj_('Matches', nx);
+  }
+  m.Winner = ''; m.Score = ''; m.Result = 'Pending'; m.EnteredBy = u.name; m.EnteredAt = now_();
+  updateObj_('Matches', m);
+  log_(u, 'clear score', m.MatchID);
+  return true;
+}
+
+function editMatch_(p, u) {
+  var m = readTable_('Matches').filter(function (x) { return x.MatchID === p.MatchID; })[0];
+  if (!m) throw new Error('Match not found');
+  ['Date', 'Time', 'Court', 'Round', 'Notes', 'SideA', 'SideB'].forEach(function (k) { if (p[k] !== undefined) m[k] = str_(p[k]); });
+  updateObj_('Matches', m);
+  log_(u, 'edit match', m.MatchID);
+  return true;
+}
+
+function addMatch_(p, u) {
+  if (!p.CategoryID) throw new Error('Choose a category');
+  var ms = readTable_('Matches');
+  var no = ms.reduce(function (mx, m) { return Math.max(mx, num_(m.MatchNo)); }, 0) + 1;
+  var o = {
+    MatchID: p.CategoryID + '-X' + no + '-' + Utilities.getUuid().slice(0, 4).toUpperCase(), CategoryID: p.CategoryID, Stage: 'Manual',
+    Round: str_(p.Round) || 'Play-off', RoundNo: num_(p.RoundNo) || 99, Group: '', MatchNo: no,
+    SideA: str_(p.SideA), SideB: str_(p.SideB), NextMatch: '', NextSlot: '', Date: str_(p.Date), Time: str_(p.Time),
+    Court: str_(p.Court), Score: '', Winner: '', Result: 'Pending', EnteredBy: '', EnteredAt: '', Notes: str_(p.Notes)
+  };
+  appendObj_('Matches', o);
+  log_(u, 'add match', o.MatchID);
+  return o.MatchID;
+}
+
+function deleteMatch_(p, u) {
+  var all = readTable_('Matches');
+  var m = all.filter(function (x) { return x.MatchID === p.MatchID; })[0];
+  if (!m) throw new Error('Match not found');
+  var feeds = all.some(function (x) { return x.NextMatch === m.MatchID; });
+  if (m.Stage === 'KO' || feeds) throw new Error('Knockout matches are linked. Clear the whole draw instead.');
+  deleteRows_('Matches', [m._row]);
+  log_(u, 'delete match', m.MatchID);
+  return true;
+}
+
+/* ======================= SCHEDULE ======================= */
+
+function parseDays_(text) {
+  var days = [];
+  str_(text).split(/\n|;/).forEach(function (line) {
+    var mm = line.trim().match(/^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/);
+    if (mm) days.push({ date: mm[1], start: +mm[2] * 60 + +mm[3], end: +mm[4] * 60 + +mm[5] });
+  });
+  days.sort(function (a, b) { return a.date < b.date ? -1 : a.date > b.date ? 1 : a.start - b.start; });
+  return days;
+}
+
+function hhmm_(mins) { var h = Math.floor(mins / 60), m = mins % 60; return (h < 10 ? '0' : '') + h + ':' + (m < 10 ? '0' : '') + m; }
+
+function autoSchedule_(p, u) {
+  var s = settings_();
+  var days = parseDays_(s.PlayDays);
+  if (!days.length) throw new Error('Add play days in Settings (e.g. 2026-11-07 07:00-19:00).');
+  var courts = Math.max(1, num_(s.Courts) || 1);
+  var defMin = num_(s.DefaultSlotMinutes) || 40;
+  var rest = num_(s.RestMinutes);
+  var cats = {}; readTable_('Categories').forEach(function (c) { cats[c.CategoryID] = c; });
+  var entries = {}; readTable_('Entries').forEach(function (e) { entries[e.EntryID] = e; });
+  var all = readTable_('Matches');
+  var onlyCats = p.categories && p.categories.length ? p.categories : null;
+  var startDay = 0, startMin = days[0].start;
+  if (p.fromDate) {
+    for (var d0 = 0; d0 < days.length; d0++) if (days[d0].date >= p.fromDate) { startDay = d0; break; }
+    startMin = days[startDay].start;
+    if (p.fromTime && days[startDay].date === p.fromDate) {
+      var t = p.fromTime.split(':'); startMin = Math.max(days[startDay].start, +t[0] * 60 + +t[1]);
+    }
+  }
+  var abs = function (dayIdx, min) { return dayIdx * 1440 + min; };
+  var dur = function (m) { return num_(cats[m.CategoryID] && cats[m.CategoryID].SlotMinutes) || defMin; };
+  var phones = function (sideId) {
+    var e = entries[sideId]; if (!e) return [];
+    return [phone_(e.P1Phone), phone_(e.P2Phone)].filter(String);
+  };
+  var feeders = {}; all.forEach(function (m) { if (m.NextMatch) (feeders[m.NextMatch] = feeders[m.NextMatch] || []).push(m); });
+
+  var todo = all.filter(function (m) {
+    return m.Result === 'Pending' && (!onlyCats || onlyCats.indexOf(m.CategoryID) >= 0) &&
+           !(p.keepManual && m.Date);
+  });
+  var todoIds = {}; todo.forEach(function (m) { todoIds[m.MatchID] = true; });
+  var finishAt = {};   // MatchID -> abs end time (for scheduled / fixed matches)
+  var playerFree = {}; // phone -> abs time free
+  // fixed matches (already scheduled and not being moved) block the court and players
+  var courtBusy = [];  // {court, s, e}
+  all.forEach(function (m) {
+    if (todoIds[m.MatchID] || !m.Date || !m.Time) return;
+    var di = -1; days.forEach(function (d, i) { if (d.date === m.Date && di < 0) di = i; });
+    if (di < 0) return;
+    var tt = String(m.Time).split(':'); var st = abs(di, +tt[0] * 60 + +tt[1]); var en = st + dur(m);
+    finishAt[m.MatchID] = en;
+    if (m.Result === 'Pending') courtBusy.push({ court: str_(m.Court) || '1', s: st, e: en });
+    phones(m.SideA).concat(phones(m.SideB)).forEach(function (ph) { playerFree[ph] = Math.max(playerFree[ph] || 0, en + rest); });
+  });
+  all.forEach(function (m) { if (m.Result === 'Bye') finishAt[m.MatchID] = -1; });
+
+  var catOrder = function (id) { return num_(cats[id] && cats[id].Order) || 99; };
+  var prio = function (m) { return m.Round === 'Final' ? 2 : m.Round === 'Semi-final' ? 1 : 0; };
+  todo.sort(function (a, b) {
+    return prio(a) - prio(b) || num_(a.RoundNo) - num_(b.RoundNo) || catOrder(a.CategoryID) - catOrder(b.CategoryID) ||
+           num_(a.MatchNo) - num_(b.MatchNo);
+  });
+
+  var courtFree = []; for (var c = 0; c < courts; c++) courtFree.push(abs(startDay, startMin));
+  var dayOf = function (t) { return Math.floor(t / 1440); };
+  var fit = function (t, len) { // move t into a play window that can hold len minutes
+    var di = Math.max(dayOf(t), startDay);
+    if (t < abs(di, 0)) t = abs(di, 0);
+    while (di < days.length) {
+      var ds = abs(di, days[di].start), de = abs(di, days[di].end);
+      if (t < ds) t = ds;
+      if (t + len <= de) return t;
+      di++; t = di < days.length ? abs(di, days[di].start) : Infinity;
+    }
+    return Infinity;
+  };
+  var clashCourt = function (ci, st, en) {
+    return courtBusy.some(function (b) { return b.court === String(ci + 1) && st < b.e && en > b.s; });
+  };
+  var earliest = function (m, courtT, ci) {
+    var t = courtT, len = dur(m);
+    var fs = feeders[m.MatchID] || [];
+    for (var i = 0; i < fs.length; i++) {
+      var f = fs[i];
+      if (f.Result !== 'Pending') continue;                // already decided
+      if (finishAt[f.MatchID] === undefined) return Infinity; // feeder not scheduled yet
+      t = Math.max(t, finishAt[f.MatchID] + rest);
+    }
+    phones(m.SideA).concat(phones(m.SideB)).forEach(function (ph) { if (playerFree[ph]) t = Math.max(t, playerFree[ph]); });
+    // feeder players (TBD side) – they also need rest; covered by feeder finish + rest
+    for (var guard = 0; guard < 200; guard++) {
+      t = fit(t, len);
+      if (t === Infinity) return Infinity;
+      if (!clashCourt(ci, t, t + len)) return t;
+      var blocking = courtBusy.filter(function (b) { return b.court === String(ci + 1) && t < b.e && t + len > b.s; });
+      t = Math.max.apply(null, blocking.map(function (b) { return b.e; }));
+    }
+    return Infinity;
+  };
+
+  var placed = 0, unplaced = [];
+  var remaining = todo.slice();
+  while (remaining.length) {
+    var ci = 0; for (var k = 1; k < courts; k++) if (courtFree[k] < courtFree[ci]) ci = k;
+    if (courtFree[ci] === Infinity) break;
+    var best = null, bestT = Infinity, bestIdx = -1;
+    for (var i = 0; i < remaining.length; i++) {
+      var tt2 = earliest(remaining[i], courtFree[ci], ci);
+      if (tt2 < bestT) { bestT = tt2; best = remaining[i]; bestIdx = i; if (tt2 === courtFree[ci]) break; }
+    }
+    if (!best) { courtFree[ci] = Infinity; continue; }
+    var en2 = bestT + dur(best);
+    best.Date = days[dayOf(bestT)].date; best.Time = hhmm_(bestT % 1440); best.Court = String(ci + 1);
+    finishAt[best.MatchID] = en2;
+    courtFree[ci] = en2;
+    phones(best.SideA).concat(phones(best.SideB)).forEach(function (ph) { playerFree[ph] = en2 + rest; });
+    remaining.splice(bestIdx, 1);
+    placed++;
+  }
+  remaining.forEach(function (m) { m.Date = ''; m.Time = ''; m.Court = ''; unplaced.push(m.MatchID); });
+  todo.forEach(function (m) { updateObj_('Matches', m); });
+  log_(u, 'auto schedule', placed + ' placed, ' + unplaced.length + ' not placed');
+  return { placed: placed, unplaced: unplaced.length };
+}
+
+/* ======================= ACCOUNTS ======================= */
+
+function saveTxn_(p, u) {
+  var amt = num_(p.Amount);
+  if (amt <= 0) throw new Error('Amount must be more than 0.');
+  if (!str_(p.Head)) throw new Error('Choose a head.');
+  var o = {
+    TxnID: p.TxnID || id_('T'), Date: str_(p.Date) || now_().slice(0, 10), Type: p.Type === 'Income' ? 'Income' : 'Expense',
+    Head: str_(p.Head), Description: str_(p.Description), Amount: amt, Mode: str_(p.Mode), Party: str_(p.Party),
+    Reference: str_(p.Reference), EnteredBy: u.name, EnteredAt: now_()
+  };
+  if (p.TxnID) {
+    var t = readTable_('Accounts').filter(function (x) { return x.TxnID === p.TxnID; })[0];
+    if (!t) throw new Error('Transaction not found');
+    o._row = t._row; updateObj_('Accounts', o);
+  } else appendObj_('Accounts', o);
+  log_(u, 'txn', o.Type + ' ' + o.Head + ' ' + amt);
+  return o.TxnID;
+}
+
+function deleteTxn_(p, u) {
+  var t = readTable_('Accounts').filter(function (x) { return x.TxnID === p.TxnID; })[0];
+  if (!t) throw new Error('Transaction not found');
+  deleteRows_('Accounts', [t._row]);
+  log_(u, 'delete txn', p.TxnID);
+  return true;
+}
+
+/* ======================= SETTINGS & USERS ======================= */
+
+function saveSettings_(p, u) {
+  var rows = readTable_('Settings');
+  Object.keys(p).forEach(function (k) {
+    var r = rows.filter(function (x) { return x.Key === k; })[0];
+    if (r) { r.Value = p[k]; updateObj_('Settings', r); }
+    else appendObj_('Settings', { Key: k, Value: p[k], Notes: '' });
+  });
+  log_(u, 'settings', Object.keys(p).join(','));
+  return true;
+}
+
+function saveUser_(p, u) {
+  if (!str_(p.Name) || !str_(p.PIN)) throw new Error('Name and PIN are required.');
+  if (!/^\d{4,8}$/.test(str_(p.PIN))) throw new Error('PIN must be 4 to 8 digits.');
+  var users = readTable_('Users');
+  var x = users.filter(function (y) { return str_(y.Name).toLowerCase() === str_(p.Name).toLowerCase(); })[0];
+  var role = ['Admin', 'Organiser', 'Scorer'].indexOf(p.Role) >= 0 ? p.Role : 'Scorer';
+  var o = x || {};
+  o.Name = str_(p.Name); o.Role = role; o.PIN = str_(p.PIN); o.Active = p.Active === 'No' ? 'No' : 'Yes';
+  if (x) updateObj_('Users', o); else appendObj_('Users', o);
+  log_(u, 'user', o.Name + ' ' + role);
+  return true;
+}
+
+function deleteUser_(p, u) {
+  var users = readTable_('Users');
+  var x = users.filter(function (y) { return str_(y.Name).toLowerCase() === str_(p.Name).toLowerCase(); })[0];
+  if (!x) throw new Error('User not found');
+  var admins = users.filter(function (y) { return y.Role === 'Admin' && yes_(y.Active); });
+  if (x.Role === 'Admin' && admins.length <= 1) throw new Error('You cannot remove the last Admin.');
+  deleteRows_('Users', [x._row]);
+  log_(u, 'delete user', x.Name);
+  return true;
+}
+
+  return { api: api, setup: setup };
+})(G.SpreadsheetApp, G.LockService, G.CacheService, G.Session, G.Utilities, G.DriveApp, {});
+  window.__demoBackend = backend;
+  window.google = { script: { run: (function () {
+    function R(s, f) { this.s = s; this.f = f; }
+    R.prototype.withSuccessHandler = function (s) { return new R(s, this.f); };
+    R.prototype.withFailureHandler = function (f) { return new R(this.s, f); };
+    R.prototype.api = function (a, p, t) { var s = this.s; setTimeout(function () { s(backend.api(a, p, t)); }, 180); };
+    return new R();
+  })() } };
+
+  // ---------- seed demo data ----------
+  var call = function (a, p, t) { var r = JSON.parse(backend.api(a, JSON.stringify(p || {}), t || '')); if (!r.ok) throw new Error(a + ': ' + r.error); return r.data; };
+  backend.setup();
+  var T = call('login', { name: 'Admin', pin: '1234' }).token;
+  call('saveSettings', { UPIId: 'aurisopen.demo@upi', Dates: 'Sat 7 & Sun 8 November 2026', ContactName: 'Organising team', ContactPhone: '98XXX XXXXX' }, T);
+  call('saveUser', { Name: 'Ravi', Role: 'Scorer', PIN: '5555' }, T);
+  call('saveUser', { Name: 'Meera', Role: 'Organiser', PIN: '7777' }, T);
+  var men = ['Arjun Mehta', 'Rohan Shah', 'Vikram Iyer', 'Karan Malhotra', 'Siddharth Rao', 'Aditya Kulkarni', 'Nikhil Desai', 'Rahul Nair', 'Amit Joshi', 'Varun Kapoor', 'Ishaan Gupta', 'Dev Patel', 'Neel Bhatt'];
+  var women = ['Priya Menon', 'Ananya Singh', 'Kavya Reddy', 'Sneha Pillai', 'Riya Sharma'];
+  var tw = ['Tower 1', 'Tower 2', 'Tower 3'];
+  var shot = { data: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', mime: 'image/png' };
+  var regs = [];
+  men.forEach(function (n, i) {
+    var cats = [{ catId: 'MS' }];
+    if (i < 6) cats.push({ catId: 'XD', partner: { name: women[i % 5].split(' ')[0] + ' ' + n.split(' ')[1], phone: String(9000020000 + i), tower: tw[i % 3] } });
+    regs.push(call('register', { player: { name: n, phone: String(9000010000 + i), tower: tw[i % 3], flat: String(101 + i * 7) }, categories: cats, last: { tournament: 'Auris Open 2025', category: "Men's Singles", result: i < 3 ? 'Semi-final' : 'Earlier round' }, paymentMode: i % 4 === 0 ? 'Cash' : 'UPI', screenshot: i % 4 === 0 ? null : shot }));
+  });
+  women.forEach(function (n, i) { regs.push(call('register', { player: { name: n, phone: String(9000030000 + i), tower: tw[i % 3] }, categories: [{ catId: 'WS' }], paymentMode: 'UPI', screenshot: shot })); });
+  for (var i = 0; i < 4; i++) regs.push(call('register', { player: { name: ['Meera Iyer', 'Tara Shah', 'Neha Rao', 'Pooja Nair'][i], phone: String(9000040000 + i), tower: tw[i % 3] }, categories: [{ catId: 'WD', partner: { name: ['Lata Iyer', 'Gita Shah', 'Isha Rao', 'Diya Nair'][i], tower: tw[i % 3] } }], paymentMode: 'UPI', screenshot: shot }));
+  regs.forEach(function (r, i) { if (i < regs.length - 2) call('setPayment', { regId: r.regId, status: 'Approved' }, T); });
+  var A = call('getAdmin', {}, T);
+  A.entries.filter(function (e) { return e.CategoryID === 'MS'; }).slice(0, 4).forEach(function (e, i) { call('updateEntry', { EntryID: e.EntryID, Seed: i + 1 }, T); });
+  call('generateDraw', { CategoryID: 'MS' }, T);
+  call('generateDraw', { CategoryID: 'WS', Format: 'Round Robin' }, T);
+  call('generateDraw', { CategoryID: 'XD' }, T);
+  call('autoSchedule', {}, T);
+  var B = call('getAdmin', {}, T);
+  B.matches.filter(function (m) { return m.CategoryID === 'MS' && m.RoundNo === 1 && m.Result === 'Pending'; }).slice(0, 3).forEach(function (m) { call('saveScore', { MatchID: m.MatchID, Winner: 'A', Score: '4-1' }, T); });
+  B.matches.filter(function (m) { return m.CategoryID === 'WS'; }).slice(0, 2).forEach(function (m, i) { call('saveScore', { MatchID: m.MatchID, Winner: i ? 'B' : 'A', Score: ['6-3', '7-5'][i] }, T); });
+  call('saveTxn', { Type: 'Expense', Head: 'Balls', Amount: 2400, Description: '4 dozen balls', Party: 'Sports shop' }, T);
+  call('saveTxn', { Type: 'Expense', Head: 'Trophies & medals', Amount: 6500, Description: 'Trophies' }, T);
+  call('saveTxn', { Type: 'Income', Head: 'Donation', Amount: 5000, Description: 'Resident donation' }, T);
+})();
+
+</script>
+<base target="_top">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auris Open – Portal Demo</title>
+<meta name="description" content="Clickable demo of the Auris Open society tennis tournament portal: registration, draws, schedule, scoring and admin.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+:root{
+  --bg:#f4f6f3; --card:#ffffff; --ink:#17231c; --muted:#5d6b62; --line:#dde3dc;
+  --pri:#1d6b45; --pri-ink:#ffffff; --pri-soft:#e4f1ea; --ball:#d6e43a;
+  --ok:#1d7a46; --ok-soft:#e1f3e8; --warn:#9a6400; --warn-soft:#fff3d6; --bad:#b3261e; --bad-soft:#fbe4e2;
+  --radius:12px; --shadow:0 1px 2px rgba(0,0,0,.06),0 2px 8px rgba(0,0,0,.04);
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+a{color:var(--pri)}
+header{background:var(--pri);color:#fff;padding:14px 16px 0}
+.brand{display:flex;align-items:center;gap:10px;justify-content:space-between}
+.brand h1{margin:0;font-size:20px;letter-spacing:.2px}
+.brand small{display:block;opacity:.85;font-size:12.5px;font-weight:400}
+.ball{width:26px;height:26px;border-radius:50%;background:var(--ball);flex:none;position:relative;overflow:hidden}
+.ball:before,.ball:after{content:"";position:absolute;width:26px;height:26px;border:2px solid #fff;border-radius:50%;top:0}
+.ball:before{left:-15px}.ball:after{right:-15px}
+.who{font-size:12px;background:rgba(255,255,255,.16);padding:4px 10px;border-radius:20px;white-space:nowrap}
+nav{display:flex;gap:4px;overflow-x:auto;margin-top:12px;scrollbar-width:none}
+nav::-webkit-scrollbar{display:none}
+nav button{background:none;border:0;color:#fff;opacity:.8;padding:10px 12px;font:inherit;font-size:14px;white-space:nowrap;border-bottom:3px solid transparent;cursor:pointer}
+nav button.on{opacity:1;border-bottom-color:var(--ball);font-weight:600}
+main{max-width:980px;margin:0 auto;padding:16px}
+.card{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:16px;margin-bottom:14px}
+h2{font-size:18px;margin:0 0 12px}
+h3{font-size:15.5px;margin:16px 0 8px}
+.muted{color:var(--muted)}
+.small{font-size:13px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
+.grid2{display:grid;gap:10px;grid-template-columns:1fr 1fr}
+@media(max-width:560px){.grid2{grid-template-columns:1fr}}
+label{display:block;font-size:13px;color:var(--muted);margin:10px 0 4px;font-weight:500}
+input,select,textarea{width:100%;padding:11px 12px;border:1px solid var(--line);border-radius:10px;font:inherit;background:#fff;color:var(--ink)}
+textarea{min-height:80px}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--pri);border-color:transparent}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:10px 16px;border-radius:10px;border:1px solid var(--line);background:#fff;color:var(--ink);font:inherit;font-weight:600;cursor:pointer;text-decoration:none}
+.btn.pri{background:var(--pri);color:#fff;border-color:var(--pri)}
+.btn.ok{background:var(--ok);color:#fff;border-color:var(--ok)}
+.btn.bad{color:var(--bad);border-color:#efc3bf}
+.btn.sm{padding:6px 10px;font-size:13px;border-radius:8px}
+.btn.block{width:100%}
+.btn:disabled{opacity:.5;cursor:default}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.chip{border:1px solid var(--line);background:#fff;border-radius:20px;padding:6px 12px;font:inherit;font-size:13.5px;cursor:pointer}
+.chip.on{background:var(--pri);border-color:var(--pri);color:#fff}
+.badge{display:inline-block;font-size:12px;font-weight:600;padding:2px 8px;border-radius:20px;background:#eef1ed;color:var(--muted)}
+.badge.ok{background:var(--ok-soft);color:var(--ok)}
+.badge.warn{background:var(--warn-soft);color:var(--warn)}
+.badge.bad{background:var(--bad-soft);color:var(--bad)}
+.badge.pri{background:var(--pri-soft);color:var(--pri)}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font-size:12.5px;color:var(--muted);font-weight:600}
+td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+.tablewrap{overflow-x:auto}
+.stat{background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);padding:14px}
+.stat b{display:block;font-size:22px;font-variant-numeric:tabular-nums}
+.stat span{font-size:12.5px;color:var(--muted)}
+.list .item{border-bottom:1px solid var(--line);padding:12px 0}
+.list .item:last-child{border-bottom:0}
+.mrow{display:grid;grid-template-columns:62px 1fr auto;gap:10px;align-items:center;padding:10px 0;border-bottom:1px solid var(--line)}
+.mrow:last-child{border-bottom:0}
+.mrow .t{font-weight:700;font-variant-numeric:tabular-nums}
+.mrow .t small{display:block;font-weight:400;color:var(--muted);font-size:12px}
+.vs{font-size:14px}
+.vs .w{font-weight:700}
+.vs .meta{font-size:12px;color:var(--muted)}
+.score{font-weight:700;font-variant-numeric:tabular-nums;white-space:nowrap}
+.bracket{display:flex;gap:18px;overflow-x:auto;padding-bottom:8px}
+.bcol{display:flex;flex-direction:column;justify-content:space-around;min-width:190px;gap:10px}
+.bcol h4{margin:0 0 4px;font-size:12.5px;color:var(--muted);text-align:center}
+.bm{border:1px solid var(--line);border-radius:10px;background:#fff;font-size:13px;overflow:hidden}
+.bm div{padding:6px 9px;display:flex;justify-content:space-between;gap:6px}
+.bm div+div{border-top:1px solid var(--line)}
+.bm .w{font-weight:700;background:var(--pri-soft)}
+.bm .s{font-size:11.5px;color:var(--muted);padding:3px 9px;background:#fafbfa;justify-content:space-between}
+.qr{display:flex;justify-content:center;padding:10px;background:#fff;border:1px dashed var(--line);border-radius:10px}
+.pay{background:var(--pri-soft);border-radius:10px;padding:12px}
+.cat-pick{border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-bottom:8px}
+.cat-pick.on{border-color:var(--pri);background:#f7fbf8}
+.cat-pick .top{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.cat-pick input[type=checkbox]{width:20px;height:20px;margin:0 8px 0 0;vertical-align:middle}
+.radio{display:flex;gap:8px}
+.radio label{flex:1;margin:0;border:1px solid var(--line);border-radius:10px;padding:12px;color:var(--ink);font-size:15px;cursor:pointer;display:flex;align-items:center;gap:8px}
+.radio input{width:auto}
+.radio label.on{border-color:var(--pri);background:var(--pri-soft);font-weight:600}
+.winpick{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.winpick button{padding:14px 10px;border-radius:10px;border:2px solid var(--line);background:#fff;font:inherit;font-weight:600;cursor:pointer;text-align:center}
+.winpick button.on{border-color:var(--pri);background:var(--pri-soft)}
+.modal{position:fixed;inset:0;background:rgba(10,20,15,.45);display:flex;align-items:flex-end;justify-content:center;z-index:50}
+.sheet{background:#fff;width:100%;max-width:560px;max-height:92vh;overflow:auto;border-radius:16px 16px 0 0;padding:18px 16px 24px}
+@media(min-width:700px){.modal{align-items:center}.sheet{border-radius:16px}}
+.sheet .x{float:right;border:0;background:none;font-size:22px;cursor:pointer;line-height:1}
+#toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#17231c;color:#fff;padding:11px 16px;border-radius:10px;font-size:14px;z-index:60;max-width:90vw;display:none}
+#toast.bad{background:var(--bad)}
+.loading{padding:40px;text-align:center;color:var(--muted)}
+.empty{padding:24px;text-align:center;color:var(--muted)}
+.warnbox{background:var(--warn-soft);color:#5c3c00;border-radius:10px;padding:10px 12px;font-size:14px;margin:10px 0}
+.okbox{background:var(--ok-soft);color:#0f4a2a;border-radius:10px;padding:12px;font-size:14px;margin:10px 0}
+.rules{white-space:pre-line}
+.inline-input{width:70px;padding:6px 8px}
+.foot{text-align:center;font-size:12px;color:var(--muted);padding:20px 0 30px}
+.hwrap{max-width:1200px;margin:0 auto}
+.bround{display:flex;flex-direction:column;min-width:190px}
+.bround h4{margin:0 0 8px;font-size:12.5px;color:var(--muted);text-align:center}
+.bround .bcol{flex:1;min-width:0}
+/* tablet & laptop */
+@media(min-width:900px){
+  header{padding:16px 24px 0}
+  main{max-width:1200px;padding:24px}
+  .card{padding:20px 22px}
+  .list.cols{display:grid;grid-template-columns:1fr 1fr;column-gap:28px}
+  .list.cols>.item,.list.cols>.mrow,.list.cols>div{border-bottom:1px solid var(--line)}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(200px,1fr))}
+  .sheet{max-width:640px}
+  .bround{min-width:220px}
+}
+@media(min-width:1400px){.list.cols{grid-template-columns:1fr 1fr 1fr}}
+@media(hover:hover){.btn:hover{filter:brightness(.97)}.chip:hover{border-color:var(--pri)}nav button:hover{opacity:1}}
+#print{display:none}
+@media print{
+  header,main,#toast,.modal,.foot{display:none!important}
+  body{background:#fff}
+  #print{display:block;font-size:12px;color:#000}
+  .pc{border:1.5px solid #000;padding:10px 12px;height:135mm;page-break-inside:avoid;margin-bottom:6mm;position:relative}
+  .pc:nth-child(2n){page-break-after:always}
+  .pc table td,.pc table th{border:1px solid #000;padding:6px;height:30px}
+  .pp table td,.pp table th{border:1px solid #888;padding:5px}
+  .pb{page-break-after:always}
+}
+.pc h4{margin:0;font-size:16px}
+.pc .hd{display:flex;justify-content:space-between;border-bottom:1px solid #000;padding-bottom:6px;margin-bottom:8px}
+.pc .sig{display:flex;justify-content:space-between;margin-top:14px;gap:20px}
+.pc .sig div{flex:1;border-top:1px solid #000;padding-top:4px;font-size:11px}
+</style>
+</head>
+<body>
+<div style="background:#d6e43a;color:#17231c;font:13px/1.4 Inter,system-ui,sans-serif;padding:8px 16px;text-align:center"><b>Demo</b> with sample data – changes reset when you refresh. Staff logins: <b>Admin</b> / 1234 · <b>Meera</b> / 7777 (Organiser) · <b>Ravi</b> / 5555 (Scorer)</div>
+<header>
+ <div class="hwrap">
+  <div class="brand">
+    <div class="row" style="gap:10px;flex-wrap:nowrap">
+      <div class="ball"></div>
+      <h1 id="tName">Auris Open<small id="tTag">Auris Serenity Towers 1, 2 &amp; 3</small></h1>
+    </div>
+    <span class="who" id="who" style="display:none"></span>
+  </div>
+  <nav id="nav"></nav>
+ </div>
+</header>
+<main id="app"><div class="loading">Loading…</div></main>
+<div class="foot" id="foot"></div>
+<div id="print"></div>
+<div id="toast"></div>
+
+<script>
+/* ===================== STATE & API ===================== */
+var S = { view:'home', token:'', me:null, pub:null, adm:null, sc:null, f:{} };
+try { var saved = JSON.parse(sessionStorage.getItem('auris_sess') || 'null'); if (saved) { S.token = saved.token; S.me = saved.me; } } catch (e) {}
+
+function call(action, payload) {
+  return new Promise(function (res, rej) {
+    google.script.run
+      .withSuccessHandler(function (s) { var r = JSON.parse(s); if (r.ok) res(r.data); else rej(new Error(r.error)); })
+      .withFailureHandler(function (e) { rej(e instanceof Error ? e : new Error(String(e && e.message || e))); })
+      .api(action, JSON.stringify(payload || {}), S.token || '');
+  });
+}
+function saveSess() { try { sessionStorage.setItem('auris_sess', JSON.stringify(S.token ? { token: S.token, me: S.me } : null)); } catch (e) {} }
+
+/* ===================== UTILITIES ===================== */
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+function money(n) { return '₹' + Number(n || 0).toLocaleString('en-IN'); }
+function $(id) { return document.getElementById(id); }
+function val(id) { var el = $(id); return el ? el.value.trim() : ''; }
+function toast(msg, bad) { var t = $('toast'); t.textContent = msg; t.className = bad ? 'bad' : ''; t.style.display = 'block'; clearTimeout(t._h); t._h = setTimeout(function () { t.style.display = 'none'; }, bad ? 5000 : 2800); }
+function fail(e) { toast(e.message || String(e), true); }
+function busy(btn, on) { if (!btn) return; btn.disabled = on; if (on) { btn._t = btn.innerHTML; btn.innerHTML = 'Please wait…'; } else if (btn._t) btn.innerHTML = btn._t; }
+function dayLabel(d) { if (!d) return 'Not scheduled'; var x = new Date(d + 'T00:00:00'); return isNaN(x) ? d : x.toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long' }); }
+function shortDay(d) { if (!d) return ''; var x = new Date(d + 'T00:00:00'); return isNaN(x) ? d : x.toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short' }); }
+function role() { return S.me ? S.me.role : ''; }
+function isStaff() { return role() === 'Admin' || role() === 'Organiser'; }
+function modal(html) { var m = document.createElement('div'); m.className = 'modal'; m.innerHTML = '<div class="sheet"><button class="x" onclick="closeModal()" aria-label="Close">×</button>' + html + '</div>'; m.addEventListener('click', function (e) { if (e.target === m) closeModal(); }); document.body.appendChild(m); }
+function closeModal() { document.querySelectorAll('.modal').forEach(function (m) { m.remove(); }); }
+
+/* data source for the current viewer */
+function D() { return isStaff() ? S.adm : role() === 'Scorer' ? S.sc : S.pub; }
+function catMap() { var m = {}; (D().categories || []).forEach(function (c) { m[c.CategoryID] = c; }); return m; }
+function entMap() {
+  var m = {}; var d = D();
+  (d.entries || []).forEach(function (e) {
+    if (e.EntryID) m[e.EntryID] = { id: e.EntryID, name: e.Player2 ? e.Player1 + ' / ' + e.Player2 : e.Player1, tower: [e.P1Tower, e.Player2 && e.P2Tower !== e.P1Tower ? e.P2Tower : ''].filter(Boolean).join(' / '), raw: e };
+    else m[e.id] = e;
+  });
+  return m;
+}
+function feederMap() { var f = {}; (D().matches || []).forEach(function (m) { if (m.NextMatch) f[m.NextMatch + m.NextSlot] = m; }); return f; }
+function sideName(m, slot, E, F) {
+  var id = slot === 'A' ? m.SideA : m.SideB;
+  if (id === 'BYE') return 'Bye';
+  if (id && E[id]) return E[id].name;
+  var fd = F && F[m.MatchID + slot];
+  return fd ? 'Winner of M' + fd.MatchNo : 'TBD';
+}
+function sideTower(m, slot, E) { var id = slot === 'A' ? m.SideA : m.SideB; return id && E[id] ? E[id].tower : ''; }
+function sortMatches(ms) {
+  return ms.slice().sort(function (a, b) {
+    var ka = (a.Date || '9999') + ' ' + (a.Time || '99:99') + ' ' + (a.Court || ''), kb = (b.Date || '9999') + ' ' + (b.Time || '99:99') + ' ' + (b.Court || '');
+    return ka < kb ? -1 : ka > kb ? 1 : (a.CategoryID < b.CategoryID ? -1 : a.CategoryID > b.CategoryID ? 1 : Number(a.MatchNo) - Number(b.MatchNo));
+  });
+}
+function resultBadge(m) {
+  if (m.Result === 'Completed') return '<span class="badge ok">Done</span>';
+  if (m.Result === 'Walkover') return '<span class="badge warn">W/O</span>';
+  if (m.Result === 'Retired') return '<span class="badge warn">Ret.</span>';
+  if (m.Result === 'Bye') return '<span class="badge">Bye</span>';
+  return '';
+}
+function parseGames(score) {
+  var s = String(score || '').replace(/\(\d+\)/g, ''); var re = /(\d+)\s*[-–]\s*(\d+)/g, r, w = 0, l = 0;
+  while ((r = re.exec(s))) { w += +r[1]; l += +r[2]; }
+  return { w: w, l: l };
+}
+
+/* ===================== NAVIGATION ===================== */
+var NAVS = {
+  Public: [['home', 'Home'], ['register', 'Register'], ['draws', 'Draws'], ['schedule', 'Matches & Results'], ['mine', 'My Entries'], ['login', 'Staff login']],
+  Scorer: [['scores', 'Enter Scores'], ['draws', 'Draws'], ['schedule', 'Matches'], ['print', 'Print'], ['logout', 'Log out']],
+  Organiser: [['dash', 'Dashboard'], ['entries', 'Entries'], ['cats', 'Categories'], ['drawadmin', 'Draws'], ['sched', 'Schedule'], ['scores', 'Scores'], ['accounts', 'Accounts'], ['print', 'Print'], ['export', 'Export'], ['logout', 'Log out']],
+  Admin: [['dash', 'Dashboard'], ['entries', 'Entries'], ['cats', 'Categories'], ['drawadmin', 'Draws'], ['sched', 'Schedule'], ['scores', 'Scores'], ['accounts', 'Accounts'], ['print', 'Print'], ['export', 'Export'], ['settings', 'Settings'], ['users', 'Users'], ['logout', 'Log out']]
+};
+function renderNav() {
+  var items = NAVS[role() || 'Public'];
+  $('nav').innerHTML = items.map(function (i) { return '<button class="' + (S.view === i[0] ? 'on' : '') + '" onclick="go(\'' + i[0] + '\')">' + i[1] + '</button>'; }).join('');
+  var on = document.querySelector('nav button.on'); if (on && on.scrollIntoView) on.scrollIntoView({ block: 'nearest', inline: 'center' });
+  var w = $('who');
+  if (S.me) { w.style.display = ''; w.textContent = S.me.name + ' · ' + S.me.role; } else w.style.display = 'none';
+}
+function go(v) {
+  if (v === 'logout') { S.token = ''; S.me = null; S.adm = null; S.sc = null; saveSess(); S.view = 'home'; return boot(); }
+  S.view = v; renderNav(); render(); window.scrollTo(0, 0);
+}
+function render() {
+  var fn = VIEWS[S.view] || VIEWS.home;
+  try { $('app').innerHTML = fn(); if (fn.after) fn.after(); } catch (e) { $('app').innerHTML = '<div class="card">Something went wrong: ' + esc(e.message) + '</div>'; console.error(e); }
+}
+function boot() {
+  $('app').innerHTML = '<div class="loading">Loading…</div>';
+  var p;
+  if (isStaff()) p = call('getAdmin').then(function (d) { S.adm = d; });
+  else if (role() === 'Scorer') p = call('getScorer').then(function (d) { S.sc = d; });
+  else p = call('getPublic').then(function (d) { S.pub = d; });
+  return p.then(function () {
+    var st = D().settings || {};
+    $('tName').innerHTML = esc(st.TournamentName || 'Auris Open') + '<small>' + esc(st.Tagline || '') + '</small>';
+    document.title = st.TournamentName || 'Auris Open';
+    $('foot').textContent = (st.Venue || '') + (st.ContactName ? ' · Contact: ' + st.ContactName + ' ' + (st.ContactPhone || '') : '');
+    if (S.me && NAVS[role()].map(function (x) { return x[0]; }).indexOf(S.view) < 0) S.view = NAVS[role()][0][0];
+    renderNav(); render();
+  }).catch(function (e) {
+    if (/Session expired/.test(e.message)) { S.token = ''; S.me = null; saveSess(); return boot(); }
+    $('app').innerHTML = '<div class="card">Could not load: ' + esc(e.message) + '</div>';
+  });
+}
+function reload() { return boot(); }
+
+/* ===================== VIEWS ===================== */
+var VIEWS = {};
+
+/* ---------- HOME ---------- */
+VIEWS.home = function () {
+  var d = S.pub, s = d.settings;
+  var cats = d.categories.slice().sort(function (a, b) { return a.Order - b.Order; });
+  return '<div class="card"><h2>' + esc(s.TournamentName) + '</h2><p>' + esc(s.About) + '</p>' +
+    '<div class="grid2"><div><span class="muted small">Dates</span><br><b>' + esc(s.Dates) + '</b></div><div><span class="muted small">Venue</span><br><b>' + esc(s.Venue) + '</b></div></div>' +
+    '<div class="row" style="margin-top:14px">' + (s.RegistrationOpen ? '<button class="btn pri" onclick="go(\'register\')">Register now</button>' : '<span class="badge bad">Registrations closed</span>') +
+    '<button class="btn" onclick="go(\'draws\')">View draws</button><button class="btn" onclick="go(\'mine\')">My entries</button></div></div>' +
+    '<div class="card"><h2>Categories</h2><div class="tablewrap"><table><tr><th>Category</th><th>Format</th><th class="num">Fee</th><th class="num">Entries</th><th></th></tr>' +
+    cats.map(function (c) {
+      return '<tr><td><b>' + esc(c.Name) + '</b><br><span class="muted small">' + esc(c.Type) + (c.Notes ? ' · ' + esc(c.Notes) : '') + '</span></td><td>' + esc(c.Format) + '</td><td class="num">' + money(c.Fee) +
+        '</td><td class="num">' + c.Entries + (c.MaxEntries ? '/' + c.MaxEntries : '') + '</td><td>' + (c.Status === 'Open' ? '<span class="badge ok">Open</span>' : '<span class="badge">Closed</span>') + '</td></tr>';
+    }).join('') + '</table></div></div>' +
+    (s.Rules ? '<div class="card"><h2>Rules</h2><div class="rules small">' + esc(s.Rules) + '</div></div>' : '');
+};
+
+/* ---------- REGISTER (also used by admin "add entry") ---------- */
+S.reg = { cats: {}, mode: 'UPI', shot: null };
+function regForm(adminMode) {
+  var d = D(), s = d.settings;
+  var cats = d.categories.filter(function (c) { return adminMode || c.Status === 'Open'; }).sort(function (a, b) { return a.Order - b.Order; });
+  var towers = ['Tower 1', 'Tower 2', 'Tower 3', 'Guest'];
+  var tSel = function (id) { return '<select id="' + id + '"><option value="">Select</option>' + towers.map(function (t) { return '<option>' + t + '</option>'; }).join('') + '</select>'; };
+  return '<h3>Your details</h3><div class="grid2"><div><label>Full name *</label><input id="r_name" autocomplete="name"></div>' +
+    '<div><label>Mobile number *</label><input id="r_phone" inputmode="tel" placeholder="10-digit mobile"></div>' +
+    '<div><label>Tower *</label>' + tSel('r_tower') + '</div><div><label>Flat no.</label><input id="r_flat"></div></div>' +
+    '<h3>Categories</h3><p class="muted small">You can enter up to ' + (s.MaxCategoriesPerPlayer || '') + ' categories.</p>' +
+    cats.map(function (c) {
+      return '<div class="cat-pick" id="cp_' + c.CategoryID + '"><div class="top"><label style="margin:0;color:var(--ink);font-size:15px;display:flex;align-items:center"><input type="checkbox" onchange="regPick(\'' + c.CategoryID + '\',this.checked)">' + esc(c.Name) + '</label><b>' + money(c.Fee) + '</b></div>' +
+        (c.Type === 'Doubles' ? '<div id="pt_' + c.CategoryID + '" style="display:none"><div class="grid2"><div><label>Partner\'s name *</label><input id="pn_' + c.CategoryID + '"></div><div><label>Partner\'s mobile</label><input id="pp_' + c.CategoryID + '" inputmode="tel"></div><div><label>Partner\'s tower</label>' + tSel('pw_' + c.CategoryID) + '</div><div><label>Partner\'s flat</label><input id="pf_' + c.CategoryID + '"></div></div><p class="muted small" style="margin:6px 0 0">Only one of you needs to register the pair.</p></div>' : '') +
+        '</div>';
+    }).join('') +
+    '<h3>Playing history <span class="muted small">(helps the organisers with seeding)</span></h3><div class="grid2">' +
+    '<div><label>Last tournament played</label><input id="r_lt" placeholder="e.g. Auris Open 2025"></div>' +
+    '<div><label>Category played</label><input id="r_lc" placeholder="e.g. Men\'s Singles"></div>' +
+    '<div><label>Last result</label><select id="r_lr"><option value="">Select</option><option>Winner</option><option>Runner-up</option><option>Semi-final</option><option>Quarter-final</option><option>Earlier round</option><option>First tournament</option></select></div>' +
+    '<div><label>Anything else?</label><input id="r_rm" placeholder="e.g. not available Sat morning"></div></div>' +
+    '<h3>Payment</h3><div class="pay"><div class="row" style="justify-content:space-between"><span>Total to pay</span><b id="r_total" style="font-size:20px">₹0</b></div>' +
+    '<div class="radio" style="margin-top:10px"><label id="m_UPI" class="on"><input type="radio" name="pm" checked onchange="regMode(\'UPI\')">UPI</label><label id="m_Cash"><input type="radio" name="pm" onchange="regMode(\'Cash\')">Cash</label></div>' +
+    '<div id="upiBox" style="margin-top:12px">' +
+    (s.UPIId ? '<div class="qr" id="qr"></div><p class="small" style="text-align:center;margin:8px 0">Scan with any UPI app or pay to <b>' + esc(s.UPIId) + '</b>' + (s.UPIName ? ' (' + esc(s.UPIName) + ')' : '') + '</p><a class="btn block" id="upiLink" href="#">Open UPI app</a>' : '<div class="warnbox">UPI ID not set yet. Please pay the organiser directly.</div>') +
+    '<label>Payment screenshot ' + (adminMode ? '' : '*') + '</label><input type="file" id="r_shot" accept="image/*" onchange="regShot(this)"><div id="shotPrev" class="small muted"></div>' +
+    '<label>UPI reference / UTR (optional)</label><input id="r_ref" placeholder="12-digit UTR from your UPI app"></div>' +
+    '<div id="cashBox" style="display:none;margin-top:10px" class="small">Hand the cash to the organiser. Your entry is confirmed once they mark it as received.</div>' +
+    '<p class="small muted" style="margin-bottom:0">' + esc(s.PaymentNote || '') + '</p></div>' +
+    (adminMode ? '<label style="display:flex;gap:8px;align-items:center;color:var(--ink)"><input type="checkbox" id="r_appr" style="width:auto" checked> Payment received – approve now</label>' : '');
+}
+function regPick(id, on) {
+  if (on) S.reg.cats[id] = true; else delete S.reg.cats[id];
+  $('cp_' + id).classList.toggle('on', on);
+  var pt = $('pt_' + id); if (pt) pt.style.display = on ? '' : 'none';
+  regTotal();
+}
+function regTotal() {
+  var cm = catMap(), t = 0; Object.keys(S.reg.cats).forEach(function (k) { t += Number(cm[k].Fee || 0); });
+  $('r_total').textContent = money(t);
+  var s = D().settings;
+  if (s.UPIId && $('qr')) {
+    var url = 'upi://pay?pa=' + encodeURIComponent(s.UPIId) + '&pn=' + encodeURIComponent(s.UPIName || 'Auris Open') + (t ? '&am=' + t : '') + '&cu=INR&tn=' + encodeURIComponent(s.TournamentName || 'Auris Open');
+    $('upiLink').href = url;
+    $('qr').innerHTML = '';
+    if (window.QRCode) new QRCode($('qr'), { text: url, width: 190, height: 190 }); else $('qr').innerHTML = '<span class="small muted">QR unavailable – use the UPI ID below</span>';
+  }
+}
+function regMode(m) { S.reg.mode = m; $('m_UPI').classList.toggle('on', m === 'UPI'); $('m_Cash').classList.toggle('on', m === 'Cash'); $('upiBox').style.display = m === 'UPI' ? '' : 'none'; $('cashBox').style.display = m === 'Cash' ? '' : 'none'; }
+function regShot(inp) {
+  var f = inp.files && inp.files[0]; if (!f) { S.reg.shot = null; return; }
+  var rd = new FileReader();
+  rd.onload = function () {
+    var img = new Image();
+    img.onload = function () {
+      var max = 1280, w = img.width, h = img.height, k = Math.min(1, max / Math.max(w, h));
+      var c = document.createElement('canvas'); c.width = Math.round(w * k); c.height = Math.round(h * k);
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      S.reg.shot = { data: c.toDataURL('image/jpeg', 0.75), mime: 'image/jpeg', name: f.name };
+      $('shotPrev').innerHTML = '<img src="' + S.reg.shot.data + '" style="max-height:120px;border-radius:8px;margin-top:6px">';
+    };
+    img.onerror = function () { S.reg.shot = null; toast('Could not read that image. Try a screenshot (JPG/PNG).', true); };
+    img.src = rd.result;
+  };
+  rd.readAsDataURL(f);
+}
+function regPayload() {
+  var cm = catMap();
+  return {
+    player: { name: val('r_name'), phone: val('r_phone'), tower: val('r_tower'), flat: val('r_flat') },
+    categories: Object.keys(S.reg.cats).map(function (id) {
+      return cm[id].Type === 'Doubles' ? { catId: id, partner: { name: val('pn_' + id), phone: val('pp_' + id), tower: val('pw_' + id), flat: val('pf_' + id) } } : { catId: id };
+    }),
+    last: { tournament: val('r_lt'), category: val('r_lc'), result: val('r_lr') },
+    remarks: val('r_rm'), paymentMode: S.reg.mode, paymentRef: val('r_ref'),
+    screenshot: S.reg.mode === 'UPI' ? S.reg.shot : null
+  };
+}
+VIEWS.register = function () {
+  S.reg = { cats: {}, mode: 'UPI', shot: null };
+  var s = S.pub.settings;
+  if (!s.RegistrationOpen) return '<div class="card"><h2>Registrations are closed</h2><p class="muted">Please contact the organisers.</p></div>';
+  return '<div class="card"><h2>Register for ' + esc(s.TournamentName) + '</h2>' + regForm(false) +
+    '<button class="btn pri block" style="margin-top:16px" onclick="regSubmit(this)">Submit registration</button></div>';
+};
+VIEWS.register.after = function () { regTotal(); };
+function regSubmit(btn) {
+  var p = regPayload();
+  if (!p.categories.length) return toast('Choose at least one category.', true);
+  busy(btn, true);
+  call('register', p).then(function (r) {
+    $('app').innerHTML = '<div class="card"><h2>Registration received</h2><div class="okbox">Reference <b>' + esc(r.regId) + '</b> · ' + r.count + ' categor' + (r.count > 1 ? 'ies' : 'y') + ' · ' + money(r.total) + '</div>' +
+      '<p>Your payment is <span class="badge warn">Pending</span> until the organiser approves it. Check the status any time under <b>My Entries</b> with your mobile number.</p>' +
+      '<div class="row"><button class="btn pri" onclick="S.f.phone=\'' + esc(p.player.phone) + '\';go(\'mine\')">My entries</button><button class="btn" onclick="reload().then(function(){go(\'home\')})">Home</button></div></div>';
+  }).catch(function (e) { busy(btn, false); fail(e); });
+}
+
+/* ---------- DRAWS ---------- */
+function drawHtml(catId) {
+  var d = D(), E = entMap(), F = feederMap(), cm = catMap(), c = cm[catId];
+  var ms = d.matches.filter(function (m) { return m.CategoryID === catId; });
+  if (!ms.length) return '<div class="empty">Draw not published yet.</div>';
+  var out = '';
+  var ko = ms.filter(function (m) { return m.Stage === 'KO'; });
+  var rr = ms.filter(function (m) { return m.Stage === 'RR'; });
+  var other = ms.filter(function (m) { return m.Stage !== 'KO' && m.Stage !== 'RR'; });
+  if (ko.length) {
+    var rounds = {}; ko.forEach(function (m) { (rounds[m.RoundNo] = rounds[m.RoundNo] || []).push(m); });
+    out += '<div class="bracket">' + Object.keys(rounds).sort(function (a, b) { return a - b; }).map(function (r) {
+      var list = rounds[r].sort(function (a, b) { return a.MatchNo - b.MatchNo; });
+      return '<div class="bround"><h4>' + esc(list[0].Round) + '</h4><div class="bcol">' + list.map(function (m) {
+        var wa = m.Winner && m.Winner === m.SideA, wb = m.Winner && m.Winner === m.SideB;
+        return '<div class="bm"><div class="' + (wa ? 'w' : '') + '"><span>' + esc(sideName(m, 'A', E, F)) + '</span>' + seedTag(m.SideA, E) + '</div><div class="' + (wb ? 'w' : '') + '"><span>' + esc(sideName(m, 'B', E, F)) + '</span>' + seedTag(m.SideB, E) + '</div>' +
+          (m.Result === 'Bye' ? '' : '<div class="s"><span>M' + m.MatchNo + (m.Date ? ' · ' + shortDay(m.Date) + ' ' + esc(m.Time) : '') + '</span><b>' + esc(m.Score) + '</b></div>') + '</div>';
+      }).join('') + '</div></div>';
+    }).join('') + '</div>';
+  }
+  if (rr.length) {
+    var groups = {}; rr.forEach(function (m) { (groups[m.Group || ''] = groups[m.Group || ''] || []).push(m); });
+    Object.keys(groups).sort().forEach(function (g) {
+      var st = standings(groups[g], E);
+      out += (g ? '<h3>Group ' + esc(g) + '</h3>' : '') + '<div class="tablewrap"><table><tr><th>#</th><th>Player / Team</th><th class="num">P</th><th class="num">W</th><th class="num">L</th><th class="num">Games</th></tr>' +
+        st.map(function (r, i) { return '<tr><td>' + (i + 1) + '</td><td><b>' + esc(r.name) + '</b><br><span class="muted small">' + esc(r.tower) + '</span></td><td class="num">' + r.p + '</td><td class="num">' + r.w + '</td><td class="num">' + r.l + '</td><td class="num">' + r.gf + '–' + r.ga + '</td></tr>'; }).join('') +
+        '</table></div><div class="list">' + sortMatches(groups[g]).map(function (m) { return matchRow(m, E, F, cm, true); }).join('') + '</div>';
+    });
+  }
+  if (other.length) out += '<h3>Other matches</h3><div class="list">' + sortMatches(other).map(function (m) { return matchRow(m, E, F, cm, true); }).join('') + '</div>';
+  return out;
+}
+function seedTag(id, E) { var e = id && E[id]; var s = e && (e.seed || (e.raw && e.raw.Seed)); return s ? '<span class="badge pri">' + esc(s) + '</span>' : ''; }
+function standings(ms, E) {
+  var t = {};
+  var add = function (id) { if (id && id !== 'BYE' && !t[id]) t[id] = { id: id, name: E[id] ? E[id].name : id, tower: E[id] ? E[id].tower : '', p: 0, w: 0, l: 0, gf: 0, ga: 0 }; };
+  ms.forEach(function (m) {
+    add(m.SideA); add(m.SideB);
+    if (!m.Winner || m.Result === 'Pending') return;
+    var w = m.Winner, l = m.Winner === m.SideA ? m.SideB : m.SideA, g = parseGames(m.Score);
+    if (!t[w] || !t[l]) return;
+    t[w].p++; t[l].p++; t[w].w++; t[l].l++; t[w].gf += g.w; t[w].ga += g.l; t[l].gf += g.l; t[l].ga += g.w;
+  });
+  return Object.keys(t).map(function (k) { return t[k]; }).sort(function (a, b) { return b.w - a.w || (b.gf - b.ga) - (a.gf - a.ga) || b.gf - a.gf || (a.name < b.name ? -1 : 1); });
+}
+function catChips(sel, fn, withAll) {
+  var cats = D().categories.slice().sort(function (a, b) { return a.Order - b.Order; });
+  return '<div class="chips">' + (withAll ? '<button class="chip ' + (!sel ? 'on' : '') + '" onclick="' + fn + '(\'\')">All</button>' : '') +
+    cats.map(function (c) { return '<button class="chip ' + (sel === c.CategoryID ? 'on' : '') + '" onclick="' + fn + '(\'' + c.CategoryID + '\')">' + esc(c.Name) + '</button>'; }).join('') + '</div>';
+}
+VIEWS.draws = function () {
+  var cats = D().categories.slice().sort(function (a, b) { return a.Order - b.Order; });
+  if (!S.f.drawCat && cats.length) S.f.drawCat = cats[0].CategoryID;
+  var c = catMap()[S.f.drawCat];
+  return '<div class="card"><h2>Draws</h2>' + catChips(S.f.drawCat, 'pickDraw') + (c ? '<p class="muted small">' + esc(c.Format) + ' · ' + esc(c.Type) + '</p>' + drawHtml(c.CategoryID) : '') + '</div>';
+};
+function pickDraw(id) { S.f.drawCat = id; render(); }
+
+/* ---------- MATCHES & RESULTS ---------- */
+function matchRow(m, E, F, cm, noCat, extra) {
+  var a = sideName(m, 'A', E, F), b = sideName(m, 'B', E, F);
+  var wa = m.Winner && m.Winner === m.SideA, wb = m.Winner && m.Winner === m.SideB;
+  var c = cm[m.CategoryID];
+  return '<div class="mrow"><div class="t">' + (m.Time ? esc(m.Time) : '—') + '<small>' + (m.Date ? shortDay(m.Date) : 'TBC') + (m.Court && (D().play ? D().play.Courts > 1 : false) ? ' · C' + esc(m.Court) : '') + '</small></div>' +
+    '<div class="vs"><div class="meta">M' + m.MatchNo + ' · ' + (noCat ? '' : esc(c ? c.Name : m.CategoryID) + ' · ') + esc(m.Round) + '</div>' +
+    '<div class="' + (wa ? 'w' : '') + '">' + esc(a) + ' <span class="meta">' + esc(sideTower(m, 'A', E)) + '</span></div>' +
+    '<div class="' + (wb ? 'w' : '') + '">' + esc(b) + ' <span class="meta">' + esc(sideTower(m, 'B', E)) + '</span></div></div>' +
+    '<div style="text-align:right"><div class="score">' + esc(m.Result === 'Bye' ? '' : m.Score) + '</div>' + resultBadge(m) + (extra || '') + '</div></div>';
+}
+VIEWS.schedule = function () {
+  var d = D(), E = entMap(), F = feederMap(), cm = catMap();
+  var st = S.f.schSt || 'all', q = (S.f.schQ || '').toLowerCase();
+  var ms = d.matches.filter(function (m) {
+    if (m.Result === 'Bye') return false;
+    if (S.f.schCat && m.CategoryID !== S.f.schCat) return false;
+    if (st === 'up' && m.Result !== 'Pending') return false;
+    if (st === 'done' && m.Result === 'Pending') return false;
+    if (q) { var t = (sideName(m, 'A', E, F) + ' ' + sideName(m, 'B', E, F)).toLowerCase(); if (t.indexOf(q) < 0) return false; }
+    return true;
+  });
+  ms = sortMatches(ms); if (st === 'done') ms.reverse();
+  var byDay = {}; ms.forEach(function (m) { (byDay[m.Date || ''] = byDay[m.Date || ''] || []).push(m); });
+  var total = d.matches.filter(function (m) { return m.Result !== 'Bye'; }).length, done = d.matches.filter(function (m) { return m.Result !== 'Pending' && m.Result !== 'Bye'; }).length;
+  return '<div class="card"><h2>Matches &amp; Results</h2><p class="muted small">' + done + ' of ' + total + ' matches played. Times are approximate – please report 15 minutes early.</p>' +
+    catChips(S.f.schCat || '', 'pickSchCat', true) +
+    '<div class="row" style="margin-bottom:8px"><div class="chips" style="margin:0">' + [['all', 'All'], ['up', 'Upcoming'], ['done', 'Results']].map(function (x) { return '<button class="chip ' + (st === x[0] ? 'on' : '') + '" onclick="S.f.schSt=\'' + x[0] + '\';render()">' + x[1] + '</button>'; }).join('') + '</div>' +
+    '<input style="flex:1;min-width:160px" placeholder="Search a name" value="' + esc(S.f.schQ || '') + '" oninput="S.f.schQ=this.value;clearTimeout(window._sq);window._sq=setTimeout(function(){render();var i=document.querySelector(\'#app input\');if(i){i.focus();i.setSelectionRange(i.value.length,i.value.length)}},350)"></div>' +
+    (ms.length ? Object.keys(byDay).sort(function (a, b) { return (a || 'z') < (b || 'z') ? -1 : 1; }).map(function (k) { return '<h3>' + esc(dayLabel(k)) + '</h3><div class="list cols">' + byDay[k].map(function (m) { return matchRow(m, E, F, cm); }).join('') + '</div>'; }).join('') : '<div class="empty">No matches to show yet.</div>') + '</div>';
+};
+function pickSchCat(id) { S.f.schCat = id; render(); }
+
+/* ---------- MY ENTRIES ---------- */
+VIEWS.mine = function () {
+  return '<div class="card"><h2>My entries</h2><p class="muted small">Enter the mobile number you registered with.</p><div class="row"><input id="m_phone" inputmode="tel" style="flex:1;min-width:180px" value="' + esc(S.f.phone || '') + '" placeholder="10-digit mobile"><button class="btn pri" onclick="lookupMine(this)">Show</button></div><div id="mineOut"></div></div>';
+};
+VIEWS.mine.after = function () { if (S.f.phone) lookupMine(); };
+function lookupMine(btn) {
+  var ph = val('m_phone'); S.f.phone = ph; busy(btn, true);
+  call('lookup', { phone: ph }).then(function (r) {
+    busy(btn, false);
+    var cm = catMap(), E = entMap(), F = feederMap(), ids = {};
+    r.entries.forEach(function (e) { ids[e.id] = true; });
+    var my = sortMatches(S.pub.matches.filter(function (m) { return (ids[m.SideA] || ids[m.SideB]) && m.Result !== 'Bye'; }));
+    $('mineOut').innerHTML = !r.entries.length ? '<div class="empty">No entries found for this number.</div>' :
+      '<h3>Entries</h3><div class="list">' + r.entries.map(function (e) {
+        var b = e.payment === 'Approved' ? '<span class="badge ok">Confirmed</span>' : e.payment === 'Rejected' ? '<span class="badge bad">Payment not received</span>' : '<span class="badge warn">Payment pending</span>';
+        return '<div class="item"><div class="row" style="justify-content:space-between"><b>' + esc(cm[e.cat] ? cm[e.cat].Name : e.cat) + '</b>' + b + '</div><div class="small muted">' + esc(e.name) + ' · ' + money(e.fee) + ' · ' + esc(e.mode) + ' · Ref ' + esc(e.reg) + (e.status === 'Withdrawn' ? ' · Withdrawn' : '') + '</div></div>';
+      }).join('') + '</div><h3>My matches</h3>' + (my.length ? '<div class="list cols">' + my.map(function (m) { return matchRow(m, E, F, cm); }).join('') + '</div>' : '<div class="empty">Your matches will appear here once the draw is made.</div>');
+  }).catch(function (e) { busy(btn, false); fail(e); });
+}
+
+/* ---------- LOGIN ---------- */
+VIEWS.login = function () {
+  return '<div class="card" style="max-width:420px;margin:0 auto"><h2>Staff login</h2><p class="muted small">For Admins, Organisers and Scorers.</p><label>Name</label><input id="l_name" autocomplete="username"><label>PIN</label><input id="l_pin" type="password" inputmode="numeric" autocomplete="current-password" onkeydown="if(event.key===\'Enter\')doLogin()"><button class="btn pri block" style="margin-top:14px" id="l_btn" onclick="doLogin()">Log in</button></div>';
+};
+function doLogin() {
+  var b = $('l_btn'); busy(b, true);
+  call('login', { name: val('l_name'), pin: val('l_pin') }).then(function (r) {
+    S.token = r.token; S.me = { name: r.name, role: r.role }; saveSess(); S.view = NAVS[r.role][0][0]; boot();
+  }).catch(function (e) { busy(b, false); fail(e); });
+}
+
+/* ---------- SCORES (scorer, organiser, admin) ---------- */
+VIEWS.scores = function () {
+  var d = D(), E = entMap(), F = feederMap(), cm = catMap();
+  var tab = S.f.scTab || 'ready', q = (S.f.scQ || '').toLowerCase();
+  var ms = d.matches.filter(function (m) {
+    if (m.Result === 'Bye') return false;
+    if (S.f.scCat && m.CategoryID !== S.f.scCat) return false;
+    var known = m.SideA && m.SideB && m.SideA !== 'BYE' && m.SideB !== 'BYE';
+    if (tab === 'ready' && !(known && m.Result === 'Pending')) return false;
+    if (tab === 'done' && m.Result === 'Pending') return false;
+    if (tab === 'wait' && !(m.Result === 'Pending' && !known)) return false;
+    if (q) { var t = ('m' + m.MatchNo + ' ' + sideName(m, 'A', E, F) + ' ' + sideName(m, 'B', E, F)).toLowerCase(); if (t.indexOf(q) < 0) return false; }
+    return true;
+  });
+  ms = sortMatches(ms); if (tab === 'done') ms.reverse();
+  var count = function (t) { return d.matches.filter(function (m) { var known = m.SideA && m.SideB && m.SideA !== 'BYE' && m.SideB !== 'BYE'; return m.Result !== 'Bye' && (t === 'ready' ? known && m.Result === 'Pending' : t === 'done' ? m.Result !== 'Pending' : m.Result === 'Pending' && !known); }).length; };
+  return '<div class="card"><h2>Enter scores</h2><p class="muted small">Tap a match, pick the winner and type the final score as written on the score sheet (winner\'s games first), e.g. 4-1, 7-5, 6-4 3-6 10-7.</p>' +
+    '<div class="chips">' + [['ready', 'To play'], ['done', 'Completed'], ['wait', 'Waiting for players']].map(function (x) { return '<button class="chip ' + (tab === x[0] ? 'on' : '') + '" onclick="S.f.scTab=\'' + x[0] + '\';render()">' + x[1] + ' (' + count(x[0]) + ')</button>'; }).join('') + '</div>' +
+    catChips(S.f.scCat || '', 'pickScCat', true) +
+    '<input placeholder="Search name or match no. (e.g. m12)" value="' + esc(S.f.scQ || '') + '" onchange="S.f.scQ=this.value;render()" style="margin-bottom:6px">' +
+    (ms.length ? '<div class="list cols">' + ms.map(function (m) {
+      var known = m.SideA && m.SideB && m.SideA !== 'BYE' && m.SideB !== 'BYE';
+      return '<div onclick="' + (known ? 'scoreModal(\'' + m.MatchID + '\')' : '') + '" style="cursor:' + (known ? 'pointer' : 'default') + '">' + matchRow(m, E, F, cm, false, known ? '<div><span class="badge pri" style="margin-top:4px">' + (m.Result === 'Pending' ? 'Enter score' : 'Edit') + '</span></div>' : '') + '</div>';
+    }).join('') + '</div>' : '<div class="empty">Nothing here.</div>') + '</div>';
+};
+function pickScCat(id) { S.f.scCat = id; render(); }
+function scoreModal(id) {
+  var d = D(), E = entMap(), F = feederMap(), cm = catMap();
+  var m = d.matches.filter(function (x) { return x.MatchID === id; })[0];
+  S.f.win = m.Winner ? (m.Winner === m.SideA ? 'A' : 'B') : '';
+  modal('<h2>M' + m.MatchNo + ' · ' + esc(cm[m.CategoryID] ? cm[m.CategoryID].Name : '') + '</h2><p class="muted small" style="margin-top:-6px">' + esc(m.Round) + (m.Date ? ' · ' + shortDay(m.Date) + ' ' + esc(m.Time) : '') + '</p>' +
+    '<label>Winner</label><div class="winpick"><button id="wA" class="' + (S.f.win === 'A' ? 'on' : '') + '" onclick="pickWin(\'A\')">' + esc(sideName(m, 'A', E, F)) + '</button><button id="wB" class="' + (S.f.win === 'B' ? 'on' : '') + '" onclick="pickWin(\'B\')">' + esc(sideName(m, 'B', E, F)) + '</button></div>' +
+    '<label>Final score (winner first)</label><input id="s_score" value="' + esc(m.Score) + '" placeholder="e.g. 4-1  or  6-4 3-6 10-7" autocomplete="off">' +
+    '<label>Result</label><select id="s_res">' + ['Completed', 'Walkover', 'Retired'].map(function (r) { return '<option ' + (m.Result === r ? 'selected' : '') + '>' + r + '</option>'; }).join('') + '</select>' +
+    '<label>Note (optional)</label><input id="s_note" value="' + esc(m.Notes) + '">' +
+    '<button class="btn pri block" style="margin-top:16px" onclick="saveScore(\'' + id + '\',this)">Save result</button>' +
+    (isStaff() && m.Result !== 'Pending' ? '<button class="btn bad block" style="margin-top:8px" onclick="clearScore(\'' + id + '\',this)">Clear this result</button>' : ''));
+}
+function pickWin(s) { S.f.win = s; $('wA').classList.toggle('on', s === 'A'); $('wB').classList.toggle('on', s === 'B'); }
+function saveScore(id, btn) {
+  if (!S.f.win) return toast('Pick the winner.', true);
+  busy(btn, true);
+  call('saveScore', { MatchID: id, Winner: S.f.win, Score: val('s_score'), Result: val('s_res'), Notes: val('s_note') })
+    .then(function () { closeModal(); toast('Result saved'); return refreshData(); })
+    .catch(function (e) { busy(btn, false); fail(e); });
+}
+function clearScore(id, btn) {
+  if (!confirmBox('Clear this result? The winner will be removed from the next round.')) return;
+  busy(btn, true);
+  call('clearScore', { MatchID: id }).then(function () { closeModal(); toast('Result cleared'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); });
+}
+function confirmBox(msg) { try { return window.confirm(msg); } catch (e) { return true; } }
+function refreshData() {
+  var p = isStaff() ? call('getAdmin').then(function (d) { S.adm = d; }) : role() === 'Scorer' ? call('getScorer').then(function (d) { S.sc = d; }) : call('getPublic').then(function (d) { S.pub = d; });
+  return p.then(render).catch(fail);
+}
+
+/* ===================== ADMIN ===================== */
+function regGroups() {
+  var g = {}; S.adm.entries.forEach(function (e) { (g[e.RegID] = g[e.RegID] || []).push(e); }); return g;
+}
+function capacity() {
+  var d = S.adm, p = d.play, cm = catMap();
+  var days = String(p.PlayDays || '').split(/\n|;/).map(function (l) { var m = l.trim().match(/^(\d{4}-\d{2}-\d{2})\s+(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$/); return m ? { date: m[1], mins: (+m[4] * 60 + +m[5]) - (+m[2] * 60 + +m[3]) } : null; }).filter(Boolean);
+  var avail = days.reduce(function (s, x) { return s + Math.max(0, x.mins); }, 0) * (p.Courts || 1);
+  var need = 0, matches = 0;
+  // matches already drawn
+  var drawn = {}; d.matches.forEach(function (m) { drawn[m.CategoryID] = true; if (m.Result !== 'Bye') { matches++; need += Number(cm[m.CategoryID] && cm[m.CategoryID].SlotMinutes) || p.DefaultSlotMinutes; } });
+  // estimate for categories not drawn yet (from current entries)
+  var est = 0;
+  d.categories.forEach(function (c) {
+    if (drawn[c.CategoryID]) return;
+    var n = d.entries.filter(function (e) { return e.CategoryID === c.CategoryID && e.Status !== 'Withdrawn'; }).length;
+    if (n < 2) return;
+    var g = Math.max(1, Math.min(Number(c.Groups) || 1, Math.floor(n / 2)));
+    var k = 0;
+    if (c.Format === 'Round Robin') { var base = Math.floor(n / g), extra = n % g; for (var i = 0; i < g; i++) { var sz = base + (i < extra ? 1 : 0); k += sz * (sz - 1) / 2; } }
+    else k = n - 1;
+    est += k; need += k * (Number(c.SlotMinutes) || p.DefaultSlotMinutes);
+  });
+  return { days: days, avail: avail, need: need, matches: matches, est: est };
+}
+VIEWS.dash = function () {
+  var d = S.adm, cm = catMap(), regs = regGroups();
+  var live = d.entries.filter(function (e) { return e.Status !== 'Withdrawn'; });
+  var appr = d.entries.filter(function (e) { return e.PaymentStatus === 'Approved'; });
+  var pend = live.filter(function (e) { return e.PaymentStatus === 'Pending'; });
+  var fees = appr.reduce(function (s, e) { return s + Number(e.Fee || 0); }, 0);
+  var pendAmt = pend.reduce(function (s, e) { return s + Number(e.Fee || 0); }, 0);
+  var inc = d.accounts.filter(function (t) { return t.Type === 'Income'; }).reduce(function (s, t) { return s + Number(t.Amount); }, 0);
+  var exp = d.accounts.filter(function (t) { return t.Type === 'Expense'; }).reduce(function (s, t) { return s + Number(t.Amount); }, 0);
+  var people = {}; live.forEach(function (e) { [e.P1Phone, e.P2Phone].forEach(function (p) { if (p) people[String(p)] = 1; }); if (!e.P2Phone && e.Player2) people[e.Player2.toLowerCase()] = 1; });
+  var cap = capacity();
+  var pct = cap.avail ? Math.round(cap.need / cap.avail * 100) : 0;
+  var stat = function (v, l) { return '<div class="stat"><b>' + v + '</b><span>' + l + '</span></div>'; };
+  return '<div class="grid" style="margin-bottom:14px">' + stat(Object.keys(regs).length, 'Registrations') + stat(Object.keys(people).length, 'Players') + stat(live.length, 'Entries') +
+    stat(pend.length, 'Payments to approve') + stat(money(fees), 'Entry fees received') + stat(money(pendAmt), 'Fees pending') + stat(money(exp), 'Expenses') + stat(money(fees + inc - exp), 'Balance') + '</div>' +
+    '<div class="card"><h2>Court time</h2>' +
+    '<p class="small">Available: <b>' + Math.round(cap.avail / 60 * 10) / 10 + ' court-hours</b> (' + cap.days.length + ' play day' + (cap.days.length === 1 ? '' : 's') + ' × ' + d.play.Courts + ' court' + (d.play.Courts > 1 ? 's' : '') + ') · Needed: <b>' + Math.round(cap.need / 60 * 10) / 10 + ' hours</b> for ' + (cap.matches + cap.est) + ' matches' + (cap.est ? ' (' + cap.est + ' estimated from entries not yet drawn)' : '') + '</p>' +
+    '<div style="height:10px;background:#eef1ed;border-radius:6px;overflow:hidden"><div style="height:10px;width:' + Math.min(100, pct) + '%;background:' + (pct > 100 ? 'var(--bad)' : pct > 85 ? 'var(--warn)' : 'var(--ok)') + '"></div></div>' +
+    (pct > 100 ? '<div class="warnbox">You need about ' + pct + '% of the court time you have. Add play days (e.g. weekday evenings for early rounds), shorten match formats or cap entries.</div>' : '<p class="muted small">' + pct + '% of court time used.</p>') + '</div>' +
+    '<div class="card"><h2>By category</h2><div class="tablewrap"><table><tr><th>Category</th><th class="num">Entries</th><th class="num">Approved</th><th class="num">Pending</th><th>Draw</th><th class="num">Played</th></tr>' +
+    d.categories.slice().sort(function (a, b) { return a.Order - b.Order; }).map(function (c) {
+      var es = live.filter(function (e) { return e.CategoryID === c.CategoryID; });
+      var ms = d.matches.filter(function (m) { return m.CategoryID === c.CategoryID && m.Result !== 'Bye'; });
+      return '<tr><td><b>' + esc(c.Name) + '</b><br><span class="small muted">' + esc(c.Format) + '</span></td><td class="num">' + es.length + (c.MaxEntries ? '/' + c.MaxEntries : '') + '</td><td class="num">' + es.filter(function (e) { return e.PaymentStatus === 'Approved'; }).length + '</td><td class="num">' + es.filter(function (e) { return e.PaymentStatus === 'Pending'; }).length +
+        '</td><td>' + (ms.length ? '<span class="badge ok">Made</span>' : '<span class="badge">Not yet</span>') + '</td><td class="num">' + ms.filter(function (m) { return m.Result !== 'Pending'; }).length + '/' + ms.length + '</td></tr>';
+    }).join('') + '</table></div></div>';
+};
+
+/* ---------- ENTRIES ---------- */
+VIEWS.entries = function () {
+  var d = S.adm, cm = catMap(), regs = regGroups();
+  var st = S.f.enSt || 'all', q = (S.f.enQ || '').toLowerCase();
+  var list = d.entries.filter(function (e) {
+    if (S.f.enCat && e.CategoryID !== S.f.enCat) return false;
+    if (st === 'pending' && !(e.PaymentStatus === 'Pending' && e.Status !== 'Withdrawn')) return false;
+    if (st === 'approved' && e.PaymentStatus !== 'Approved') return false;
+    if (st === 'cash' && e.PaymentMode !== 'Cash') return false;
+    if (st === 'withdrawn' && e.Status !== 'Withdrawn') return false;
+    if (q && (e.Player1 + ' ' + e.Player2 + ' ' + e.P1Phone + ' ' + e.P2Phone + ' ' + e.P1Flat + ' ' + e.RegID).toLowerCase().indexOf(q) < 0) return false;
+    return true;
+  }).sort(function (a, b) { return a.Timestamp < b.Timestamp ? 1 : -1; });
+  return '<div class="card"><div class="row" style="justify-content:space-between"><h2 style="margin:0">Entries (' + list.length + ')</h2><button class="btn pri sm" onclick="addEntryModal()">+ Add entry</button></div><div style="height:12px"></div>' +
+    '<div class="chips">' + [['all', 'All'], ['pending', 'Payment pending'], ['approved', 'Approved'], ['cash', 'Cash'], ['withdrawn', 'Withdrawn']].map(function (x) { return '<button class="chip ' + (st === x[0] ? 'on' : '') + '" onclick="S.f.enSt=\'' + x[0] + '\';render()">' + x[1] + '</button>'; }).join('') + '</div>' +
+    catChips(S.f.enCat || '', 'pickEnCat', true) +
+    '<input placeholder="Search name, phone, flat or reference" value="' + esc(S.f.enQ || '') + '" onchange="S.f.enQ=this.value;render()">' +
+    '<div class="list cols">' + (list.length ? list.map(function (e) {
+      var sib = regs[e.RegID] || [], tot = sib.reduce(function (s, x) { return s + Number(x.Fee || 0); }, 0);
+      var pb = e.PaymentStatus === 'Approved' ? '<span class="badge ok">Paid · ' + esc(e.PaymentMode) + '</span>' : e.PaymentStatus === 'Rejected' ? '<span class="badge bad">Rejected</span>' : '<span class="badge warn">Pending · ' + esc(e.PaymentMode) + '</span>';
+      return '<div class="item"><div class="row" style="justify-content:space-between;align-items:flex-start"><div><b>' + esc(e.Player1) + (e.Player2 ? ' / ' + esc(e.Player2) : '') + '</b> ' + (e.Status === 'Withdrawn' ? '<span class="badge bad">Withdrawn</span>' : '') +
+        '<div class="small muted">' + esc(cm[e.CategoryID] ? cm[e.CategoryID].Name : e.CategoryID) + ' · ' + esc(e.P1Tower) + ' ' + esc(e.P1Flat) + ' · <a href="tel:' + esc(e.P1Phone) + '">' + esc(e.P1Phone) + '</a>' + (e.Player2 ? ' · Partner: ' + esc(e.P2Tower) + ' ' + esc(e.P2Flat) + ' ' + esc(e.P2Phone) : '') + '</div>' +
+        '<div class="small muted">Last: ' + esc([e.LastTournament, e.LastCategory, e.LastResult].filter(Boolean).join(' · ') || '—') + (e.Remarks ? ' · Note: ' + esc(e.Remarks) : '') + '</div>' +
+        '<div class="small muted">Ref ' + esc(e.RegID) + ' · ' + esc(e.Timestamp) + ' · ' + money(e.Fee) + (sib.length > 1 ? ' (registration total ' + money(tot) + ')' : '') + (e.PaymentRef ? ' · UTR ' + esc(e.PaymentRef) : '') + '</div></div>' +
+        '<div style="text-align:right">' + pb + '<div class="row" style="justify-content:flex-end;margin-top:6px;gap:6px"><span class="small muted">Seed</span><input class="inline-input" type="number" min="1" value="' + esc(e.Seed) + '" onchange="setSeed(\'' + e.EntryID + '\',this.value)"></div></div></div>' +
+        '<div class="row" style="margin-top:8px;gap:6px">' +
+        (e.PaymentStatus !== 'Approved' ? '<button class="btn ok sm" onclick="pay(\'' + e.RegID + '\',\'Approved\',\'\',this)">Approve ' + money(tot) + '</button>' + (e.PaymentMode !== 'Cash' ? '<button class="btn sm" onclick="pay(\'' + e.RegID + '\',\'Approved\',\'Cash\',this)">Cash received</button>' : '') : '<button class="btn sm" onclick="pay(\'' + e.RegID + '\',\'Pending\',\'\',this)">Undo approval</button>') +
+        (e.PaymentStatus === 'Pending' ? '<button class="btn bad sm" onclick="pay(\'' + e.RegID + '\',\'Rejected\',\'\',this)">Reject</button>' : '') +
+        (e.ScreenshotID ? '<button class="btn sm" onclick="viewShot(\'' + e.ScreenshotID + '\',this)">Screenshot</button>' : '') +
+        '<button class="btn sm" onclick="editEntry(\'' + e.EntryID + '\')">Edit</button>' +
+        '<button class="btn sm" onclick="withdraw(\'' + e.EntryID + '\',\'' + (e.Status === 'Withdrawn' ? 'Active' : 'Withdrawn') + '\',this)">' + (e.Status === 'Withdrawn' ? 'Reinstate' : 'Withdraw') + '</button>' +
+        '<button class="btn bad sm" onclick="delEntry(\'' + e.EntryID + '\',this)">Delete</button></div></div>';
+    }).join('') : '<div class="empty">No entries match.</div>') + '</div></div>';
+};
+function pickEnCat(id) { S.f.enCat = id; render(); }
+function pay(reg, status, mode, btn) { busy(btn, true); call('setPayment', { regId: reg, status: status, mode: mode }).then(function (n) { toast(status === 'Approved' ? 'Approved (' + n + ' entr' + (n > 1 ? 'ies' : 'y') + ')' : 'Updated'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); }); }
+function setSeed(id, v) { call('updateEntry', { EntryID: id, Seed: v }).then(function () { var e = S.adm.entries.filter(function (x) { return x.EntryID === id; })[0]; if (e) e.Seed = v; toast('Seed saved'); }).catch(fail); }
+function withdraw(id, st, btn) { busy(btn, true); call('updateEntry', { EntryID: id, Status: st }).then(function () { toast(st === 'Withdrawn' ? 'Marked withdrawn' : 'Reinstated'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); }); }
+function delEntry(id, btn) { if (!confirmBox('Delete this entry permanently?')) return; busy(btn, true); call('deleteEntry', { EntryID: id }).then(function () { toast('Deleted'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); }); }
+function viewShot(id, btn) { busy(btn, true); call('getScreenshot', { id: id }).then(function (src) { busy(btn, false); modal('<h2>Payment screenshot</h2><img src="' + src + '" style="width:100%;border-radius:10px">'); }).catch(function (e) { busy(btn, false); fail(e); }); }
+function editEntry(id) {
+  var e = S.adm.entries.filter(function (x) { return x.EntryID === id; })[0], cm = catMap();
+  var f = function (k, l, t) { return '<div><label>' + l + '</label><input id="ee_' + k + '" ' + (t ? 'type="' + t + '"' : '') + ' value="' + esc(e[k]) + '"></div>'; };
+  modal('<h2>Edit entry</h2><div class="grid2">' + '<div><label>Category</label><select id="ee_CategoryID">' + S.adm.categories.map(function (c) { return '<option value="' + c.CategoryID + '" ' + (c.CategoryID === e.CategoryID ? 'selected' : '') + '>' + esc(c.Name) + '</option>'; }).join('') + '</select></div>' +
+    f('Player1', 'Player') + f('P1Phone', 'Mobile') + f('P1Tower', 'Tower') + f('P1Flat', 'Flat') + f('Player2', 'Partner') + f('P2Phone', 'Partner mobile') + f('P2Tower', 'Partner tower') + f('P2Flat', 'Partner flat') +
+    f('LastTournament', 'Last tournament') + f('LastCategory', 'Category played') + f('LastResult', 'Last result') + f('Fee', 'Fee (₹)', 'number') +
+    '<div><label>Payment mode</label><select id="ee_PaymentMode"><option ' + (e.PaymentMode === 'UPI' ? 'selected' : '') + '>UPI</option><option ' + (e.PaymentMode === 'Cash' ? 'selected' : '') + '>Cash</option></select></div>' + f('PaymentRef', 'UTR / reference') + f('Seed', 'Seed', 'number') + f('Remarks', 'Remarks') + '</div>' +
+    '<button class="btn pri block" style="margin-top:14px" onclick="saveEntryEdit(\'' + id + '\',this)">Save</button>');
+}
+function saveEntryEdit(id, btn) {
+  var p = { EntryID: id };
+  ['CategoryID', 'Player1', 'P1Phone', 'P1Tower', 'P1Flat', 'Player2', 'P2Phone', 'P2Tower', 'P2Flat', 'LastTournament', 'LastCategory', 'LastResult', 'Fee', 'PaymentMode', 'PaymentRef', 'Seed', 'Remarks'].forEach(function (k) { p[k] = val('ee_' + k); });
+  busy(btn, true); call('updateEntry', p).then(function () { closeModal(); toast('Saved'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); });
+}
+function addEntryModal() {
+  S.reg = { cats: {}, mode: 'Cash', shot: null };
+  modal('<h2>Add entry</h2><p class="muted small">For walk-in or phone registrations. Closed categories are allowed here.</p>' + regForm(true) + '<button class="btn pri block" style="margin-top:14px" onclick="addEntrySubmit(this)">Add entry</button>');
+  regMode('Cash'); regTotal();
+}
+function addEntrySubmit(btn) {
+  var p = regPayload(); p.approveNow = $('r_appr').checked;
+  if (!p.categories.length) return toast('Choose at least one category.', true);
+  busy(btn, true); call('addEntry', p).then(function (r) { closeModal(); toast('Added ' + r.count + ' entr' + (r.count > 1 ? 'ies' : 'y')); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); });
+}
+
+/* ---------- CATEGORIES ---------- */
+VIEWS.cats = function () {
+  var d = S.adm;
+  return '<div class="card"><div class="row" style="justify-content:space-between"><h2 style="margin:0">Categories</h2><button class="btn pri sm" onclick="catModal()">+ Add category</button></div><div style="height:10px"></div><div class="tablewrap"><table><tr><th>Code</th><th>Name</th><th>Type</th><th>Format</th><th class="num">Fee</th><th class="num">Max</th><th class="num">Mins</th><th>Status</th><th></th></tr>' +
+    d.categories.slice().sort(function (a, b) { return a.Order - b.Order; }).map(function (c) {
+      return '<tr><td>' + esc(c.CategoryID) + '</td><td><b>' + esc(c.Name) + '</b></td><td>' + esc(c.Type) + '</td><td>' + esc(c.Format) + (c.Format === 'Round Robin' && Number(c.Groups) > 1 ? ' (' + c.Groups + ' groups)' : '') + '</td><td class="num">' + money(c.Fee) + '</td><td class="num">' + esc(c.MaxEntries || '—') + '</td><td class="num">' + esc(c.SlotMinutes || d.play.DefaultSlotMinutes) + '</td><td>' + (c.Status === 'Open' ? '<span class="badge ok">Open</span>' : '<span class="badge">Closed</span>') + '</td><td><button class="btn sm" onclick="catModal(\'' + c.CategoryID + '\')">Edit</button></td></tr>';
+    }).join('') + '</table></div><p class="muted small">"Mins" is the time slot per match used for the schedule. Leave blank to use the default (' + d.play.DefaultSlotMinutes + ' min).</p></div>';
+};
+function catModal(id) {
+  var c = id ? catMap()[id] : { CategoryID: '', Name: '', Type: 'Singles', Format: 'Knockout', Groups: 1, Fee: '', MaxEntries: '', SlotMinutes: '', Status: 'Open', Order: S.adm.categories.length + 1, Notes: '' };
+  var sel = function (k, opts) { return '<select id="c_' + k + '">' + opts.map(function (o) { return '<option ' + (c[k] === o ? 'selected' : '') + '>' + o + '</option>'; }).join('') + '</select>'; };
+  modal('<h2>' + (id ? 'Edit' : 'Add') + ' category</h2><div class="grid2"><div><label>Code (short, e.g. MS)</label><input id="c_CategoryID" value="' + esc(c.CategoryID) + '" ' + (id ? 'readonly' : '') + '></div><div><label>Name</label><input id="c_Name" value="' + esc(c.Name) + '"></div>' +
+    '<div><label>Type</label>' + sel('Type', ['Singles', 'Doubles']) + '</div><div><label>Format</label>' + sel('Format', ['Knockout', 'Round Robin']) + '</div>' +
+    '<div><label>Groups (round robin)</label><input id="c_Groups" type="number" min="1" value="' + esc(c.Groups || 1) + '"></div><div><label>Entry fee (₹)</label><input id="c_Fee" type="number" value="' + esc(c.Fee) + '"></div>' +
+    '<div><label>Max entries</label><input id="c_MaxEntries" type="number" value="' + esc(c.MaxEntries) + '"></div><div><label>Minutes per match</label><input id="c_SlotMinutes" type="number" value="' + esc(c.SlotMinutes) + '" placeholder="default"></div>' +
+    '<div><label>Status</label>' + sel('Status', ['Open', 'Closed']) + '</div><div><label>Display order</label><input id="c_Order" type="number" value="' + esc(c.Order) + '"></div></div>' +
+    '<label>Notes (shown to players)</label><input id="c_Notes" value="' + esc(c.Notes) + '">' +
+    '<button class="btn pri block" style="margin-top:14px" onclick="saveCat(this)">Save</button>' + (id ? '<button class="btn bad block" style="margin-top:8px" onclick="delCat(\'' + id + '\',this)">Delete category</button>' : ''));
+}
+function saveCat(btn) {
+  var p = {}; ['CategoryID', 'Name', 'Type', 'Format', 'Groups', 'Fee', 'MaxEntries', 'SlotMinutes', 'Status', 'Order', 'Notes'].forEach(function (k) { p[k] = val('c_' + k); });
+  busy(btn, true); call('saveCategory', p).then(function () { closeModal(); toast('Saved'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); });
+}
+function delCat(id, btn) { if (!confirmBox('Delete this category?')) return; busy(btn, true); call('deleteCategory', { CategoryID: id }).then(function () { closeModal(); toast('Deleted'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); }); }
+
+/* ---------- DRAWS (ADMIN) ---------- */
+VIEWS.drawadmin = function () {
+  var d = S.adm, cats = d.categories.slice().sort(function (a, b) { return a.Order - b.Order; });
+  if (!S.f.daCat && cats.length) S.f.daCat = cats[0].CategoryID;
+  var c = catMap()[S.f.daCat]; if (!c) return '<div class="card">Add a category first.</div>';
+  var ap = d.entries.filter(function (e) { return e.CategoryID === c.CategoryID && e.PaymentStatus === 'Approved' && e.Status !== 'Withdrawn'; })
+    .sort(function (a, b) { return (Number(a.Seed) || 999) - (Number(b.Seed) || 999); });
+  var pend = d.entries.filter(function (e) { return e.CategoryID === c.CategoryID && e.PaymentStatus === 'Pending' && e.Status !== 'Withdrawn'; }).length;
+  var ms = d.matches.filter(function (m) { return m.CategoryID === c.CategoryID; });
+  var n = ap.length, ko = n > 1 ? n - 1 : 0, rr = n * (n - 1) / 2;
+  return '<div class="card"><h2>Seeding &amp; draws</h2>' + catChips(S.f.daCat, 'pickDa') +
+    '<div class="grid2"><div><b>' + n + '</b> approved entries' + (pend ? ' · <span class="badge warn">' + pend + ' payment(s) pending – not included</span>' : '') + '<div class="muted small">Knockout needs ' + ko + ' matches · single-group round robin needs ' + rr + '.</div></div>' +
+    (ms.length ? '<div style="text-align:right"><button class="btn bad sm" onclick="clearDraw(\'' + c.CategoryID + '\',this)">Clear draw</button></div>' :
+      '<div><div class="grid2"><div><label>Format</label><select id="d_fmt"><option ' + (c.Format === 'Knockout' ? 'selected' : '') + '>Knockout</option><option ' + (c.Format === 'Round Robin' ? 'selected' : '') + '>Round Robin</option></select></div><div><label>Groups (RR)</label><input id="d_grp" type="number" min="1" value="' + esc(c.Groups || 1) + '"></div></div><button class="btn pri block" style="margin-top:10px" onclick="genDraw(\'' + c.CategoryID + '\',this)">Generate draw</button></div>') + '</div>' +
+    (!ms.length ? '<h3>Seeds</h3><p class="muted small">Give the strongest players seed 1, 2, 3… Leave blank for unseeded (placed randomly). Seeds are kept apart in a knockout and spread across groups in a round robin.</p><div class="tablewrap"><table><tr><th>Seed</th><th>Player / Team</th><th>Last result</th></tr>' +
+      ap.map(function (e) { return '<tr><td><input class="inline-input" type="number" min="1" value="' + esc(e.Seed) + '" onchange="setSeed(\'' + e.EntryID + '\',this.value)"></td><td><b>' + esc(e.Player1) + (e.Player2 ? ' / ' + esc(e.Player2) : '') + '</b><br><span class="small muted">' + esc(e.P1Tower) + '</span></td><td class="small">' + esc([e.LastTournament, e.LastCategory, e.LastResult].filter(Boolean).join(' · ') || '—') + '</td></tr>'; }).join('') + '</table></div>' : '<h3>Draw</h3>' + drawHtml(c.CategoryID)) + '</div>';
+};
+function pickDa(id) { S.f.daCat = id; render(); }
+function genDraw(id, btn) { busy(btn, true); call('generateDraw', { CategoryID: id, Format: val('d_fmt'), Groups: val('d_grp') }).then(function (r) { toast('Draw created: ' + r.matches + ' matches'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); }); }
+function clearDraw(id, btn) {
+  if (!confirmBox('Clear the whole draw for this category? Scheduled times will be lost.')) return;
+  busy(btn, true);
+  call('clearDraw', { CategoryID: id }).catch(function (e) {
+    if (/already have results/.test(e.message) && confirmBox(e.message.replace('Tick "force" to clear anyway.', '') + ' Clear anyway?')) return call('clearDraw', { CategoryID: id, force: true });
+    throw e;
+  }).then(function () { toast('Draw cleared'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); });
+}
+
+/* ---------- SCHEDULE (ADMIN) ---------- */
+VIEWS.sched = function () {
+  var d = S.adm, E = entMap(), F = feederMap(), cm = catMap(), cap = capacity();
+  var ms = sortMatches(d.matches.filter(function (m) { return m.Result !== 'Bye' && (!S.f.saCat || m.CategoryID === S.f.saCat); }));
+  var uns = d.matches.filter(function (m) { return m.Result === 'Pending' && !m.Date; }).length;
+  return '<div class="card"><h2>Schedule</h2><p class="small">Play days: ' + (cap.days.map(function (x) { return shortDay(x.date) + ' (' + Math.round(x.mins / 6) / 10 + ' h)'; }).join(', ') || '<b>none set</b>') + ' · Courts: ' + d.play.Courts + ' · Default slot: ' + d.play.DefaultSlotMinutes + ' min · Rest between a player\'s matches: ' + d.play.RestMinutes + ' min' + (role() === 'Admin' ? ' · <a href="#" onclick="go(\'settings\');return false">change</a>' : '') + '</p>' +
+    '<div class="grid2"><div><label>Reschedule from date (optional)</label><input id="as_d" type="date"></div><div><label>From time</label><input id="as_t" type="time"></div></div>' +
+    '<label style="display:flex;gap:8px;align-items:center;color:var(--ink)"><input type="checkbox" id="as_keep" style="width:auto"> Keep matches that already have a time (only fill the rest)</label>' +
+    '<button class="btn pri" style="margin-top:10px" onclick="autoSched(this)">Auto-schedule unplayed matches</button>' +
+    (uns ? '<div class="warnbox">' + uns + ' unplayed match(es) have no time. If auto-schedule cannot fit them, add play days in Settings.</div>' : '') +
+    '<p class="muted small">Order: early rounds first, categories mixed, semi-finals and finals last. A player is never given two matches closer than the rest time. You can change any time below.</p></div>' +
+    '<div class="card"><div class="row" style="justify-content:space-between"><h2 style="margin:0">Order of play</h2><button class="btn sm" onclick="addMatchModal()">+ Add match</button></div><div style="height:10px"></div>' + catChips(S.f.saCat || '', 'pickSa', true) +
+    '<div class="tablewrap"><table><tr><th>M#</th><th>Match</th><th>Date</th><th>Time</th>' + (d.play.Courts > 1 ? '<th>Ct</th>' : '') + '<th></th></tr>' +
+    ms.map(function (m) {
+      return '<tr><td>' + m.MatchNo + '</td><td><span class="small muted">' + esc(cm[m.CategoryID] ? cm[m.CategoryID].Name : '') + ' · ' + esc(m.Round) + '</span><br>' + esc(sideName(m, 'A', E, F)) + ' <span class="muted">v</span> ' + esc(sideName(m, 'B', E, F)) + (m.Result !== 'Pending' ? ' <b>' + esc(m.Score) + '</b>' : '') + '</td>' +
+        '<td><input type="date" value="' + esc(m.Date) + '" id="md_' + m.MatchID + '" style="min-width:130px;padding:6px"></td><td><input type="time" value="' + esc(m.Time) + '" id="mt_' + m.MatchID + '" style="min-width:95px;padding:6px"></td>' +
+        (d.play.Courts > 1 ? '<td><input class="inline-input" style="width:50px" value="' + esc(m.Court) + '" id="mc_' + m.MatchID + '"></td>' : '') +
+        '<td><button class="btn sm" onclick="saveTime(\'' + m.MatchID + '\',this)">Save</button>' + (m.Stage === 'Manual' ? ' <button class="btn bad sm" onclick="delMatch(\'' + m.MatchID + '\',this)">×</button>' : '') + '</td></tr>';
+    }).join('') + '</table></div>' + (ms.length ? '' : '<div class="empty">Generate draws first.</div>') + '</div>';
+};
+function pickSa(id) { S.f.saCat = id; render(); }
+function autoSched(btn) {
+  if (!confirmBox('Auto-schedule will set times for unplayed matches. Continue?')) return;
+  busy(btn, true);
+  call('autoSchedule', { fromDate: val('as_d'), fromTime: val('as_t'), keepManual: $('as_keep').checked }).then(function (r) {
+    toast(r.placed + ' matches scheduled' + (r.unplaced ? ' · ' + r.unplaced + ' could not fit' : ''), r.unplaced > 0); return refreshData();
+  }).catch(function (e) { busy(btn, false); fail(e); });
+}
+function saveTime(id, btn) {
+  var p = { MatchID: id, Date: val('md_' + id), Time: val('mt_' + id) }; if ($('mc_' + id)) p.Court = val('mc_' + id); else p.Court = '1';
+  busy(btn, true); call('editMatch', p).then(function () { busy(btn, false); toast('Time saved'); var m = S.adm.matches.filter(function (x) { return x.MatchID === id; })[0]; if (m) { m.Date = p.Date; m.Time = p.Time; m.Court = p.Court; } }).catch(function (e) { busy(btn, false); fail(e); });
+}
+function addMatchModal() {
+  var d = S.adm, E = entMap();
+  var opts = function (cat) { return '<option value="">TBD</option>' + d.entries.filter(function (e) { return (!cat || e.CategoryID === cat) && e.Status !== 'Withdrawn'; }).map(function (e) { return '<option value="' + e.EntryID + '">' + esc(E[e.EntryID].name) + '</option>'; }).join(''); };
+  modal('<h2>Add a match</h2><p class="muted small">For play-offs, a final between group winners, or a re-match. Links to the draw are not created automatically.</p>' +
+    '<label>Category</label><select id="am_c" onchange="document.getElementById(\'am_a\').innerHTML=document.getElementById(\'am_b\').innerHTML=window._amOpts(this.value)">' + d.categories.map(function (c) { return '<option value="' + c.CategoryID + '">' + esc(c.Name) + '</option>'; }).join('') + '</select>' +
+    '<label>Round name</label><input id="am_r" placeholder="e.g. Final, Semi-final, Play-off">' +
+    '<div class="grid2"><div><label>Side A</label><select id="am_a"></select></div><div><label>Side B</label><select id="am_b"></select></div><div><label>Date</label><input type="date" id="am_d"></div><div><label>Time</label><input type="time" id="am_t"></div></div>' +
+    '<button class="btn pri block" style="margin-top:14px" onclick="addMatch(this)">Add match</button>');
+  window._amOpts = opts; $('am_a').innerHTML = $('am_b').innerHTML = opts($('am_c').value);
+}
+function addMatch(btn) {
+  busy(btn, true);
+  call('addMatch', { CategoryID: val('am_c'), Round: val('am_r'), SideA: val('am_a'), SideB: val('am_b'), Date: val('am_d'), Time: val('am_t'), Court: '1' })
+    .then(function () { closeModal(); toast('Match added'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); });
+}
+function delMatch(id, btn) { if (!confirmBox('Delete this match?')) return; busy(btn, true); call('deleteMatch', { MatchID: id }).then(function () { toast('Deleted'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); }); }
+
+/* ---------- ACCOUNTS ---------- */
+function accSummary() {
+  var d = S.adm, rows = [];
+  var appr = d.entries.filter(function (e) { return e.PaymentStatus === 'Approved'; });
+  var upi = appr.filter(function (e) { return e.PaymentMode !== 'Cash'; }).reduce(function (s, e) { return s + Number(e.Fee || 0); }, 0);
+  var cash = appr.filter(function (e) { return e.PaymentMode === 'Cash'; }).reduce(function (s, e) { return s + Number(e.Fee || 0); }, 0);
+  var heads = function (type) { var h = {}; d.accounts.filter(function (t) { return t.Type === type; }).forEach(function (t) { h[t.Head] = (h[t.Head] || 0) + Number(t.Amount); }); return h; };
+  var inc = heads('Income'), exp = heads('Expense');
+  var ti = upi + cash + Object.keys(inc).reduce(function (s, k) { return s + inc[k]; }, 0);
+  var te = Object.keys(exp).reduce(function (s, k) { return s + exp[k]; }, 0);
+  return { upi: upi, cash: cash, inc: inc, exp: exp, ti: ti, te: te };
+}
+VIEWS.accounts = function () {
+  var d = S.adm, a = accSummary();
+  var line = function (l, v, b) { return '<tr><td>' + (b ? '<b>' + l + '</b>' : l) + '</td><td class="num">' + (b ? '<b>' + money(v) + '</b>' : money(v)) + '</td></tr>'; };
+  return '<div class="grid2"><div class="card"><h2>Income</h2><table>' + line('Entry fees – UPI', a.upi) + line('Entry fees – Cash', a.cash) + Object.keys(a.inc).map(function (k) { return line(esc(k), a.inc[k]); }).join('') + line('Total income', a.ti, 1) + '</table></div>' +
+    '<div class="card"><h2>Expenses</h2><table>' + (Object.keys(a.exp).length ? Object.keys(a.exp).map(function (k) { return line(esc(k), a.exp[k]); }).join('') : '<tr><td class="muted">No expenses yet</td><td></td></tr>') + line('Total expenses', a.te, 1) + '</table></div></div>' +
+    '<div class="card"><div class="row" style="justify-content:space-between"><h2 style="margin:0">Balance: ' + money(a.ti - a.te) + '</h2><button class="btn pri sm" onclick="txnModal()">+ Add income / expense</button></div><div style="height:10px"></div>' +
+    '<div class="tablewrap"><table><tr><th>Date</th><th>Type</th><th>Head</th><th>Description</th><th class="num">Amount</th><th></th></tr>' +
+    d.accounts.slice().sort(function (x, y) { return x.Date < y.Date ? 1 : -1; }).map(function (t) { return '<tr><td>' + esc(t.Date) + '</td><td>' + (t.Type === 'Income' ? '<span class="badge ok">Income</span>' : '<span class="badge bad">Expense</span>') + '</td><td>' + esc(t.Head) + '</td><td class="small">' + esc(t.Description) + (t.Party ? '<br><span class="muted">' + esc(t.Party) + '</span>' : '') + '</td><td class="num">' + money(t.Amount) + '</td><td><button class="btn sm" onclick="txnModal(\'' + t.TxnID + '\')">Edit</button></td></tr>'; }).join('') +
+    '</table></div>' + (d.accounts.length ? '' : '<div class="empty">Entry fees are counted automatically from approved payments. Add donations, society funds and expenses here.</div>') + '</div>';
+};
+function txnModal(id) {
+  var d = S.adm, t = id ? d.accounts.filter(function (x) { return x.TxnID === id; })[0] : { Type: 'Expense', Date: new Date().toISOString().slice(0, 10), Head: '', Description: '', Amount: '', Mode: 'UPI', Party: '', Reference: '' };
+  var heads = function (type) { return (type === 'Income' ? d.heads.income : d.heads.expense).map(function (h) { return '<option ' + (t.Head === h ? 'selected' : '') + '>' + esc(h) + '</option>'; }).join(''); };
+  window._heads = heads;
+  modal('<h2>' + (id ? 'Edit' : 'Add') + ' transaction</h2><div class="grid2"><div><label>Type</label><select id="t_Type" onchange="document.getElementById(\'t_Head\').innerHTML=window._heads(this.value)"><option ' + (t.Type === 'Expense' ? 'selected' : '') + '>Expense</option><option ' + (t.Type === 'Income' ? 'selected' : '') + '>Income</option></select></div>' +
+    '<div><label>Date</label><input type="date" id="t_Date" value="' + esc(t.Date) + '"></div><div><label>Head</label><select id="t_Head">' + heads(t.Type) + '</select></div><div><label>Amount (₹)</label><input type="number" id="t_Amount" value="' + esc(t.Amount) + '"></div>' +
+    '<div><label>Mode</label><select id="t_Mode">' + ['UPI', 'Cash', 'Bank transfer', 'Cheque'].map(function (m) { return '<option ' + (t.Mode === m ? 'selected' : '') + '>' + m + '</option>'; }).join('') + '</select></div><div><label>Paid to / received from</label><input id="t_Party" value="' + esc(t.Party) + '"></div></div>' +
+    '<label>Description</label><input id="t_Description" value="' + esc(t.Description) + '"><label>Bill / reference no.</label><input id="t_Reference" value="' + esc(t.Reference) + '">' +
+    '<button class="btn pri block" style="margin-top:14px" onclick="saveTxn(\'' + (id || '') + '\',this)">Save</button>' + (id ? '<button class="btn bad block" style="margin-top:8px" onclick="delTxn(\'' + id + '\',this)">Delete</button>' : ''));
+}
+function saveTxn(id, btn) {
+  var p = { TxnID: id }; ['Type', 'Date', 'Head', 'Amount', 'Mode', 'Party', 'Description', 'Reference'].forEach(function (k) { p[k] = val('t_' + k); });
+  busy(btn, true); call('saveTxn', p).then(function () { closeModal(); toast('Saved'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); });
+}
+function delTxn(id, btn) { if (!confirmBox('Delete this transaction?')) return; busy(btn, true); call('deleteTxn', { TxnID: id }).then(function () { closeModal(); toast('Deleted'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); }); }
+
+/* ---------- PRINT ---------- */
+VIEWS.print = function () {
+  var d = D(), cats = d.categories.slice().sort(function (a, b) { return a.Order - b.Order; });
+  var dates = {}; d.matches.forEach(function (m) { if (m.Date) dates[m.Date] = 1; });
+  var catSel = '<select id="p_cat"><option value="">All categories</option>' + cats.map(function (c) { return '<option value="' + c.CategoryID + '">' + esc(c.Name) + '</option>'; }).join('') + '</select>';
+  var daySel = '<select id="p_day"><option value="">All days</option>' + Object.keys(dates).sort().map(function (k) { return '<option value="' + k + '">' + dayLabel(k) + '</option>'; }).join('') + '</select>';
+  return '<div class="card"><h2>Print</h2><div class="grid2"><div><label>Category</label>' + catSel + '</div><div><label>Day</label>' + daySel + '</div></div>' +
+    '<label style="display:flex;gap:8px;align-items:center;color:var(--ink)"><input type="checkbox" id="p_pend" style="width:auto" checked> Only matches not yet played</label>' +
+    '<div class="grid" style="margin-top:14px"><button class="btn pri" onclick="printCards()">Referee score cards</button><button class="btn" onclick="printOrder()">Order of play</button><button class="btn" onclick="printDraws()">Draw sheets</button>' +
+    (isStaff() ? '<button class="btn" onclick="printEntries()">Entry / sign-in list</button><button class="btn" onclick="printAccounts()">Accounts statement</button>' : '') + '</div>' +
+    '<p class="muted small">Score cards print two per A4 page. The referee writes the games for each set, the final score and the winner; a scorer then enters the final score here.</p></div>';
+};
+function printMatches() {
+  var cat = val('p_cat'), day = val('p_day'), pend = $('p_pend').checked;
+  return sortMatches(D().matches.filter(function (m) { return m.Result !== 'Bye' && (!cat || m.CategoryID === cat) && (!day || m.Date === day) && (!pend || m.Result === 'Pending'); }));
+}
+function doPrint(html) { $('print').innerHTML = html; setTimeout(function () { window.print(); }, 150); }
+function printCards() {
+  var E = entMap(), F = feederMap(), cm = catMap(), t = D().settings.TournamentName;
+  var ms = printMatches(); if (!ms.length) return toast('No matches for this selection.', true);
+  doPrint(ms.map(function (m) {
+    var row = function (slot) { return '<tr><td style="width:38%"><b>' + esc(sideName(m, slot, E, F)) + '</b><br><span style="font-size:10px">' + esc(sideTower(m, slot, E)) + '</span></td><td></td><td></td><td></td><td></td><td></td></tr>'; };
+    return '<div class="pc"><div class="hd"><div><h4>' + esc(t) + '</h4><div>' + esc(cm[m.CategoryID] ? cm[m.CategoryID].Name : '') + ' · ' + esc(m.Round) + '</div></div><div style="text-align:right"><h4>Match ' + m.MatchNo + '</h4><div>' + esc(m.Date ? shortDay(m.Date) : '') + ' ' + esc(m.Time || '') + (m.Court ? ' · Court ' + esc(m.Court) : '') + '</div></div></div>' +
+      '<p style="margin:4px 0 8px">Format for this round: ______________________ &nbsp; Start time: ________ &nbsp; End time: ________</p>' +
+      '<table style="width:100%;border-collapse:collapse"><tr><th>Player / Team</th><th>Set 1</th><th>Set 2</th><th>Set 3</th><th>Set 4</th><th>Set 5</th></tr>' + row('A') + row('B') + '</table>' +
+      '<p style="margin:14px 0 4px">Final score (winner first): ______________________ &nbsp;&nbsp; Winner: ___________________________________</p>' +
+      '<p style="margin:8px 0">☐ Completed &nbsp;&nbsp; ☐ Walkover &nbsp;&nbsp; ☐ Retired &nbsp;&nbsp; Notes: _________________________________________</p>' +
+      '<div class="sig"><div>Referee name &amp; signature</div><div>Player A signature</div><div>Player B signature</div></div></div>';
+  }).join(''));
+}
+function printOrder() {
+  var E = entMap(), F = feederMap(), cm = catMap(), t = D().settings.TournamentName, ms = printMatches();
+  if (!ms.length) return toast('No matches for this selection.', true);
+  var by = {}; ms.forEach(function (m) { (by[m.Date || ''] = by[m.Date || ''] || []).push(m); });
+  doPrint(Object.keys(by).sort().map(function (k) {
+    return '<div class="pp pb"><h2>' + esc(t) + ' – Order of play</h2><h3>' + esc(dayLabel(k)) + '</h3><table style="width:100%;border-collapse:collapse"><tr><th>Time</th><th>M#</th><th>Category</th><th>Round</th><th>Side A</th><th>Side B</th><th>Score</th></tr>' +
+      by[k].map(function (m) { return '<tr><td>' + esc(m.Time) + '</td><td>' + m.MatchNo + '</td><td>' + esc(cm[m.CategoryID] ? cm[m.CategoryID].Name : '') + '</td><td>' + esc(m.Round) + '</td><td>' + esc(sideName(m, 'A', E, F)) + '</td><td>' + esc(sideName(m, 'B', E, F)) + '</td><td style="min-width:80px">' + esc(m.Result !== 'Pending' ? m.Score : '') + '</td></tr>'; }).join('') + '</table></div>';
+  }).join(''));
+}
+function printDraws() {
+  var cat = val('p_cat'), t = D().settings.TournamentName;
+  var cats = D().categories.filter(function (c) { return (!cat || c.CategoryID === cat) && D().matches.some(function (m) { return m.CategoryID === c.CategoryID; }); });
+  if (!cats.length) return toast('No draws made yet.', true);
+  doPrint(cats.map(function (c) { return '<div class="pp pb"><h2>' + esc(t) + ' – ' + esc(c.Name) + '</h2>' + drawHtml(c.CategoryID) + '</div>'; }).join('') +
+    '<style>@media print{.bracket{flex-wrap:nowrap;overflow:visible}.bround,.bcol{min-width:0;flex:1}.bm{font-size:10px}}</style>');
+}
+function printEntries() {
+  var cat = val('p_cat'), cm = catMap(), t = D().settings.TournamentName;
+  var cats = S.adm.categories.filter(function (c) { return !cat || c.CategoryID === cat; }).sort(function (a, b) { return a.Order - b.Order; });
+  doPrint(cats.map(function (c) {
+    var es = S.adm.entries.filter(function (e) { return e.CategoryID === c.CategoryID && e.Status !== 'Withdrawn'; });
+    return '<div class="pp pb"><h2>' + esc(t) + ' – ' + esc(c.Name) + ' (' + es.length + ')</h2><table style="width:100%;border-collapse:collapse"><tr><th>#</th><th>Player / Team</th><th>Tower / Flat</th><th>Mobile</th><th>Seed</th><th>Payment</th><th>Sign-in</th></tr>' +
+      es.map(function (e, i) { return '<tr><td>' + (i + 1) + '</td><td>' + esc(e.Player1) + (e.Player2 ? ' / ' + esc(e.Player2) : '') + '</td><td>' + esc(e.P1Tower + ' ' + e.P1Flat) + '</td><td>' + esc(e.P1Phone) + '</td><td>' + esc(e.Seed) + '</td><td>' + esc(e.PaymentStatus + ' · ' + e.PaymentMode) + '</td><td style="width:90px"></td></tr>'; }).join('') + '</table></div>';
+  }).join(''));
+}
+function printAccounts() {
+  var a = accSummary(), d = S.adm, t = d.settings.TournamentName;
+  var line = function (l, v) { return '<tr><td>' + l + '</td><td style="text-align:right">' + money(v) + '</td></tr>'; };
+  doPrint('<div class="pp"><h2>' + esc(t) + ' – Accounts statement</h2><p>Printed ' + new Date().toLocaleString('en-GB') + '</p><h3>Income</h3><table style="width:100%;border-collapse:collapse">' + line('Entry fees – UPI', a.upi) + line('Entry fees – Cash', a.cash) + Object.keys(a.inc).map(function (k) { return line(esc(k), a.inc[k]); }).join('') + line('<b>Total income</b>', a.ti) + '</table>' +
+    '<h3>Expenses</h3><table style="width:100%;border-collapse:collapse">' + Object.keys(a.exp).map(function (k) { return line(esc(k), a.exp[k]); }).join('') + line('<b>Total expenses</b>', a.te) + '</table><h3>Balance: ' + money(a.ti - a.te) + '</h3>' +
+    '<h3>Transactions</h3><table style="width:100%;border-collapse:collapse"><tr><th>Date</th><th>Type</th><th>Head</th><th>Description</th><th>Party</th><th>Ref</th><th>Amount</th></tr>' + d.accounts.map(function (x) { return '<tr><td>' + esc(x.Date) + '</td><td>' + esc(x.Type) + '</td><td>' + esc(x.Head) + '</td><td>' + esc(x.Description) + '</td><td>' + esc(x.Party) + '</td><td>' + esc(x.Reference) + '</td><td style="text-align:right">' + money(x.Amount) + '</td></tr>'; }).join('') + '</table>' +
+    '<div class="sig" style="display:flex;gap:40px;margin-top:40px"><div style="flex:1;border-top:1px solid #000">Treasurer</div><div style="flex:1;border-top:1px solid #000">Organiser</div></div></div>');
+}
+
+/* ---------- EXPORT ---------- */
+function csv(rows) { return rows.map(function (r) { return r.map(function (v) { v = String(v == null ? '' : v); return /[",\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }).join(','); }).join('\r\n'); }
+function download(name, rows) {
+  var text = '﻿' + csv(rows);
+  try {
+    var a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([text], { type: 'text/csv;charset=utf-8' })); a.download = name; document.body.appendChild(a); a.click(); a.remove();
+    toast('Downloading ' + name);
+  } catch (e) {
+    modal('<h2>' + esc(name) + '</h2><p class="small muted">Download was blocked. Copy the text below into Excel.</p><textarea style="min-height:300px">' + esc(text) + '</textarea>');
+  }
+}
+VIEWS.export = function () {
+  var d = S.adm, x = 'https://docs.google.com/spreadsheets/d/' + d.sheetId + '/export?format=xlsx';
+  return '<div class="card"><h2>Export</h2><div class="grid"><button class="btn" onclick="exEntries()">Entries (CSV)</button><button class="btn" onclick="exMatches()">Matches &amp; results (CSV)</button><button class="btn" onclick="exStandings()">Standings &amp; winners (CSV)</button><button class="btn" onclick="exAccounts()">Accounts (CSV)</button></div>' +
+    '<h3>Whole database</h3><div class="row"><a class="btn pri" href="' + x + '" target="_blank">Download as Excel (.xlsx)</a><a class="btn" href="' + esc(d.sheetUrl) + '" target="_blank">Open Google Sheet</a></div><p class="muted small">The Excel download and the sheet link work for Google accounts that have access to the sheet.</p></div>';
+};
+function exEntries() {
+  var cm = catMap(), h = ['EntryID', 'RegID', 'Timestamp', 'Category', 'Player1', 'P1Tower', 'P1Flat', 'P1Phone', 'Player2', 'P2Tower', 'P2Flat', 'P2Phone', 'LastTournament', 'LastCategory', 'LastResult', 'Fee', 'PaymentMode', 'PaymentRef', 'PaymentStatus', 'ApprovedBy', 'ApprovedAt', 'Seed', 'Group', 'Status', 'Remarks'];
+  download('auris-entries.csv', [h].concat(S.adm.entries.map(function (e) { return h.map(function (k) { return k === 'Category' ? (cm[e.CategoryID] ? cm[e.CategoryID].Name : e.CategoryID) : e[k]; }); })));
+}
+function exMatches() {
+  var E = entMap(), F = feederMap(), cm = catMap();
+  var h = ['Match no.', 'Category', 'Round', 'Group', 'Date', 'Time', 'Court', 'Side A', 'Side B', 'Score', 'Winner', 'Result', 'Entered by', 'Entered at'];
+  download('auris-matches.csv', [h].concat(sortMatches(S.adm.matches).map(function (m) { return [m.MatchNo, cm[m.CategoryID] ? cm[m.CategoryID].Name : m.CategoryID, m.Round, m.Group, m.Date, m.Time, m.Court, sideName(m, 'A', E, F), sideName(m, 'B', E, F), m.Score, m.Winner && E[m.Winner] ? E[m.Winner].name : '', m.Result, m.EnteredBy, m.EnteredAt]; })));
+}
+function exStandings() {
+  var E = entMap(), rows = [['Category', 'Stage', 'Group', 'Position', 'Player / Team', 'Played', 'Won', 'Lost', 'Games won', 'Games lost']];
+  S.adm.categories.forEach(function (c) {
+    var ms = S.adm.matches.filter(function (m) { return m.CategoryID === c.CategoryID; });
+    var rr = ms.filter(function (m) { return m.Stage === 'RR'; }), groups = {};
+    rr.forEach(function (m) { (groups[m.Group || ''] = groups[m.Group || ''] || []).push(m); });
+    Object.keys(groups).sort().forEach(function (g) { standings(groups[g], E).forEach(function (r, i) { rows.push([c.Name, 'Round robin', g, i + 1, r.name, r.p, r.w, r.l, r.gf, r.ga]); }); });
+    var fin = ms.filter(function (m) { return m.Stage === 'KO' && m.Round === 'Final'; })[0];
+    if (fin && fin.Winner) { var ru = fin.Winner === fin.SideA ? fin.SideB : fin.SideA; rows.push([c.Name, 'Knockout', '', 'Winner', E[fin.Winner] ? E[fin.Winner].name : '', '', '', '', '', '']); rows.push([c.Name, 'Knockout', '', 'Runner-up', E[ru] ? E[ru].name : '', '', '', '', '', '']); }
+  });
+  download('auris-standings.csv', rows);
+}
+function exAccounts() {
+  var a = accSummary(), rows = [['Date', 'Type', 'Head', 'Description', 'Party', 'Mode', 'Reference', 'Amount']];
+  rows.push(['', 'Income', 'Entry fees – UPI (approved)', '', '', 'UPI', '', a.upi]);
+  rows.push(['', 'Income', 'Entry fees – Cash (approved)', '', '', 'Cash', '', a.cash]);
+  S.adm.accounts.forEach(function (t) { rows.push([t.Date, t.Type, t.Head, t.Description, t.Party, t.Mode, t.Reference, t.Type === 'Expense' ? -t.Amount : t.Amount]); });
+  rows.push(['', '', '', '', '', '', 'Balance', a.ti - a.te]);
+  download('auris-accounts.csv', rows);
+}
+
+/* ---------- SETTINGS (ADMIN) ---------- */
+VIEWS.settings = function () {
+  var rows = S.adm.settingsRaw;
+  var long = { About: 1, Rules: 1, PlayDays: 1, PaymentNote: 1 };
+  return '<div class="card"><h2>Settings</h2>' + rows.map(function (r, i) {
+    return '<label>' + esc(r.Key.replace(/([a-z])([A-Z])/g, '$1 $2')) + (r.Notes ? ' <span style="font-weight:400">– ' + esc(r.Notes) + '</span>' : '') + '</label>' +
+      (long[r.Key] ? '<textarea id="st_' + i + '">' + esc(r.Value) + '</textarea>' : '<input id="st_' + i + '" value="' + esc(r.Value) + '">');
+  }).join('') + '<button class="btn pri block" style="margin-top:16px" onclick="saveSettings(this)">Save settings</button></div>';
+};
+function saveSettings(btn) {
+  var p = {}; S.adm.settingsRaw.forEach(function (r, i) { p[r.Key] = $('st_' + i).value; });
+  busy(btn, true); call('saveSettings', p).then(function () { toast('Settings saved'); return boot(); }).catch(function (e) { busy(btn, false); fail(e); });
+}
+
+/* ---------- USERS (ADMIN) ---------- */
+VIEWS.users = function () {
+  return '<div class="card"><div class="row" style="justify-content:space-between"><h2 style="margin:0">Staff logins</h2><button class="btn pri sm" onclick="userModal()">+ Add person</button></div>' +
+    '<p class="muted small"><b>Admin</b>: everything incl. settings and logins. <b>Organiser</b>: entries, payments, draws, schedule, scores, accounts, print, export. <b>Scorer</b>: enter scores and print score cards only.</p>' +
+    '<table><tr><th>Name</th><th>Role</th><th>PIN</th><th>Active</th><th></th></tr>' + S.adm.users.map(function (u) { return '<tr><td><b>' + esc(u.Name) + '</b></td><td>' + esc(u.Role) + '</td><td>' + esc(u.PIN) + '</td><td>' + esc(u.Active) + '</td><td><button class="btn sm" onclick="userModal(\'' + esc(u.Name) + '\')">Edit</button></td></tr>'; }).join('') + '</table></div>';
+};
+function userModal(name) {
+  var u = name ? S.adm.users.filter(function (x) { return x.Name === name; })[0] : { Name: '', Role: 'Scorer', PIN: String(Math.floor(1000 + Math.random() * 9000)), Active: 'Yes' };
+  modal('<h2>' + (name ? 'Edit' : 'Add') + ' login</h2><label>Name</label><input id="u_Name" value="' + esc(u.Name) + '" ' + (name ? 'readonly' : '') + '>' +
+    '<label>Role</label><select id="u_Role">' + ['Scorer', 'Organiser', 'Admin'].map(function (r) { return '<option ' + (u.Role === r ? 'selected' : '') + '>' + r + '</option>'; }).join('') + '</select>' +
+    '<label>PIN (4–8 digits)</label><input id="u_PIN" inputmode="numeric" value="' + esc(u.PIN) + '"><label>Active</label><select id="u_Active"><option ' + (u.Active !== 'No' ? 'selected' : '') + '>Yes</option><option ' + (u.Active === 'No' ? 'selected' : '') + '>No</option></select>' +
+    '<button class="btn pri block" style="margin-top:14px" onclick="saveUser(this)">Save</button>' + (name ? '<button class="btn bad block" style="margin-top:8px" onclick="delUser(\'' + esc(name) + '\',this)">Remove</button>' : ''));
+}
+function saveUser(btn) { busy(btn, true); call('saveUser', { Name: val('u_Name'), Role: val('u_Role'), PIN: val('u_PIN'), Active: val('u_Active') }).then(function () { closeModal(); toast('Saved'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); }); }
+function delUser(name, btn) { if (!confirmBox('Remove ' + name + '?')) return; busy(btn, true); call('deleteUser', { Name: name }).then(function () { closeModal(); toast('Removed'); return refreshData(); }).catch(function (e) { busy(btn, false); fail(e); }); }
+
+boot();
+</script>
+</body>
+</html>
