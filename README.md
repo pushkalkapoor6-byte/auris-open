@@ -16,9 +16,9 @@ Players don't log in – they register, pay and check their matches with their m
 
 | Laptop | Phone |
 |---|---|
-| ![Draws](screenshots/laptop-draws.jpg) | ![Home](screenshots/phone-home.jpg) |
-| ![Matches](screenshots/laptop-matches.jpg) | ![Register](screenshots/phone-register.jpg) |
-| ![Admin dashboard](screenshots/laptop-admin-dashboard.jpg) | ![Scorer](screenshots/phone-scorer.jpg) |
+| ![Draws](laptop-draws.jpg) | ![Home](phone-home.jpg) |
+| ![Matches](laptop-matches.jpg) | ![Register](phone-register.jpg) |
+| ![Admin dashboard](laptop-admin-dashboard.jpg) | ![Scorer](phone-scorer.jpg) |
 
 ## What it does
 
@@ -56,7 +56,7 @@ The live portal runs on one Google account: a **Google Sheet is the database** a
 index.html            Clickable demo (sample data, runs fully in the browser)
 apps-script/Code.gs   Backend for Google Apps Script
 apps-script/Index.html Front end for Google Apps Script
-screenshots/          Images used above
+*.jpg                 Screenshots used above
 ```
 
 This repository holds code and made-up demo data only. Real player names, phone numbers and payments stay in the organisers' Google Sheet.
